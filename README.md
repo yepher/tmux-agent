@@ -8,7 +8,13 @@ windows, and narrates what it's doing.
 Built on `livekit-agents` + OpenAI Realtime. Terminal rendering goes through `pyte`
 so ANSI colors and attributes survive.
 
+**Browser Example**
 [![Watch the demo](https://img.youtube.com/vi/yQYDYB9REl0/maxresdefault.jpg)](https://youtu.be/yQYDYB9REl0)
+
+**Mobile Example**
+[![Watch the demo](https://img.youtube.com/vi/0i5sbigrLJ8/maxresdefault.jpg)](https://youtu.be/0i5sbigrLJ8)
+
+
 
 ## What it does
 
