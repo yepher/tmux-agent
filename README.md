@@ -8,6 +8,8 @@ windows, and narrates what it's doing.
 Built on `livekit-agents` + OpenAI Realtime. Terminal rendering goes through `pyte`
 so ANSI colors and attributes survive.
 
+[![Watch the demo](https://img.youtube.com/vi/yQYDYB9REl0/maxresdefault.jpg)](https://youtu.be/yQYDYB9REl0)
+
 ## What it does
 
 - **Screen share** — captures the active tmux pane every frame, renders it to an
