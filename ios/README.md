@@ -1,68 +1,73 @@
 # ios — TmuxAgent mobile client
 
-Custom iOS app that joins the LiveKit room, subscribes to the tmux agent's
-screen-share + audio, and tunnels HTTP requests from an in-app WebKit view
-through the agent so you can view dev sites Claude is running on
-`localhost:3000` inside the app.
+SwiftUI app that joins the LiveKit room, subscribes to the tmux agent's
+screen-share + audio, and tunnels HTTP requests from an in-app `WKWebView`
+through the agent so you can browse a dev server running on the agent
+machine (e.g. `http://localhost:3000`) from your phone.
 
-## Plan
-
-1. **Phase 1 — Connect.** SwiftUI app with a settings screen (LiveKit URL,
-   API key, API secret, room name). Persist to Keychain. Connect to the room
-   using a locally-minted JWT; render the agent's screen-share track and pipe
-   mic audio back.
-2. **Phase 2 — WebKit.** Embed a `WKWebView`. Hit `localhost:3000` over the
-   tunnel (phase 3); until then just load `about:blank` and show scaffolding.
-3. **Phase 3 — HTTP tunnel.** Register a `WKURLSchemeHandler` for a custom
-   scheme (`tunnel://`). Every fetch made by the WKWebView gets serialized
-   and sent to the agent over LiveKit; the agent proxies to `http://localhost:3000`
-   and streams the response back. Ship raw bytes via LiveKit *byte streams*
-   (not RPC) — JS/HTML payloads blow past the 15 KB RPC cap.
-
-## Create the Xcode project
-
-Put the Xcode project right under `ios/` so the folder ends up:
+## Layout
 
 ```
 ios/
-├── README.md          ← you are here
-└── TmuxAgent/         ← the .xcodeproj and Swift sources
+├── README.md                 ← you are here
+├── client-sdk-swift/         ← local clone of livekit/client-sdk-swift (SPM path dep)
+└── tmuxVoiceAgent/
+    ├── tmuxVoiceAgent.xcodeproj
+    └── tmuxVoiceAgent/       ← Swift sources
 ```
 
-Steps:
+Key sources:
 
-1. Open Xcode → **File → New → Project…**
-2. **iOS → App**, Next.
-3. Product Name: `TmuxAgent`. Interface: **SwiftUI**. Language: **Swift**.
-   Storage: **None**. Include Tests: your call.
-4. Bundle ID: `com.chriswilson.tmuxagent` (or whatever).
-5. Save into `tmux_agent/ios/` (don't create an extra enclosing folder —
-   Xcode will add `TmuxAgent/` for you).
-6. Minimum Deployment: **iOS 17.0**.
+- `tmuxVoiceAgentApp.swift` — `@main`, installs the orientation-lock app delegate.
+- `ContentView.swift` — tab root: Agent / Browser / Settings.
+- `SettingsStore.swift` + `SettingsView.swift` — Keychain-backed creds form.
+- `Keychain.swift` — Security-framework wrapper.
+- `TokenBuilder.swift` — HS256 JWT minting via CryptoKit.
+- `RoomConnection.swift` — `@Observable` LiveKit room + delegate adapter.
+- `RoomView.swift` — renders the agent's video track, mic toggle, hangup.
+- `LiveKitVideoView.swift` — `UIViewRepresentable` wrapping `LiveKit.VideoView`.
+- `BrowserView.swift` — `WKWebView` + address bar + reload button.
+- `ProxyClient.swift` — `actor` that ships `HTTPRequest`/`HTTPResponse` over
+  LiveKit byte streams.
+- `TunnelSchemeHandler.swift` — `WKURLSchemeHandler` for the `tunnel://` scheme.
+- `OrientationLock.swift` — per-view `UIInterfaceOrientationMask` helper.
 
-## Add LiveKit Swift SDK
+## Xcode setup
 
-In Xcode:
+1. Open `tmuxVoiceAgent/tmuxVoiceAgent.xcodeproj`.
+2. Bundle ID defaults to `com.chriswilson.tmuxagent` — change in Signing &
+   Capabilities.
+3. Minimum deployment target: iOS 17.0.
+4. Signing: pick your team. For on-device runs you need a dev profile.
 
-1. **File → Add Package Dependencies…**
-2. URL: `https://github.com/livekit/client-sdk-swift`
-3. Rule: **Up to Next Major** from the latest release (currently 2.x).
-4. Add `LiveKit` to the `TmuxAgent` app target.
+### LiveKit SDK dependency
 
-Info.plist additions the SDK needs:
+The project links `LiveKit` via a **local path** dependency at
+`ios/client-sdk-swift/`. If you pulled this repo fresh, clone the SDK alongside
+the app:
+
+```bash
+cd ios
+git clone https://github.com/livekit/client-sdk-swift
+# git checkout a tagged release if you prefer reproducibility
+```
+
+If you'd rather use the remote SPM version: **File → Add Package Dependencies…
+→ `https://github.com/livekit/client-sdk-swift`** and remove the local
+reference. The local path was adopted because Xcode's GitHub auth kept failing
+in the author's environment.
+
+### Info.plist keys
 
 - `NSMicrophoneUsageDescription` — "Talk to the tmux agent."
-- `NSCameraUsageDescription` — optional; only if you later publish camera.
 - `NSLocalNetworkUsageDescription` — "Connect to LiveKit."
-- Background modes: **Audio, AirPlay, and Picture in Picture** (so audio
-  keeps flowing when the screen is off).
+- Background modes: **Audio, AirPlay, and Picture in Picture** so audio keeps
+  flowing when the screen is off.
 
-## Settings storage
+## Settings
 
-Put LiveKit creds in the Keychain (via `Security` framework or a small helper
-like `KeychainAccess`). Never UserDefaults — API secret is sensitive.
-
-Minimum fields to capture in `SettingsView`:
+LiveKit creds live in the Keychain (`Keychain.swift`), not UserDefaults — the
+API secret is sensitive. Fields the settings form captures:
 
 - `livekit_url` (e.g. `wss://chris-test-xxx.livekit.cloud`)
 - `livekit_api_key`
@@ -70,67 +75,68 @@ Minimum fields to capture in `SettingsView`:
 - `room_name` (free text, e.g. `my-room`)
 - `identity` (free text, e.g. `mobile-user`)
 
-Mint the JWT on-device with the `api_key`/`api_secret` and join with that.
-Keeps things simple for a dev tool; move to a token-server later if you
-share this beyond yourself.
+Tokens are minted on-device via `TokenBuilder`. For a dev tool this is fine —
+move to a token server if you distribute the app.
 
-## HTTP tunnel — protocol sketch
+On connect the room name is suffixed with the current epoch seconds
+(`my-room-1713461234`) so every reconnect lands in a fresh room and doesn't
+inherit stale participants.
 
-This lives inside the LiveKit room; agent and app are both participants.
+## Agent tab — video display
 
-**Wire format** (both directions), CBOR or JSON — start with JSON for
-debuggability, switch to CBOR later if payload size matters:
+LiveKit publishes the tmux pane as a 16:9 track. The phone stays in portrait;
+the video is displayed sideways (landscape-in-portrait) via the standard
+"swap the frame, rotate -90°, swap back" pattern in `RoomView.swift`. See the
+comment block at the top of that file for the three-step breakdown.
 
-```
-Request  (app → agent)       Response (agent → app)
-{                            {
-  "id": "<uuid>",              "id": "<uuid>",
-  "method": "GET",             "status": 200,
-  "path": "/foo?bar=1",        "headers": { ... },
-  "headers": { ... },          "body_b64": "<base64>"
-  "body_b64": "<base64>"     }
-}
-```
+Controls:
 
-**Transport:** LiveKit byte streams (not RPC — RPC payloads cap at ~15 KB).
+- **Hangup / Connect** — nav bar top-right. Red `phone.down.fill` with a
+  confirmation dialog when connected; green `phone.fill` when disconnected.
+- **Mic** — floating circle in lower-right, only visible when connected.
+- **Mic errors** (e.g. simulator mic -4010) surface as a banner above the mic
+  button without tearing the call down.
 
-- App opens a byte stream with topic `http.request`, name = request id.
-  Writes JSON header frame, then request body bytes.
-- Agent's matching stream handler reads the request, fires `aiohttp` at
-  `http://localhost:3000{path}`, reads the response, opens a byte stream
-  back with topic `http.response`, name = request id, writes status/headers
-  then body.
-- App correlates by id, hands bytes to the `URLSchemeTask`.
+Run on a **physical iPhone**. The iOS Simulator's CoreAudio stack is broken on
+Xcode 16 / macOS 15 (error `-4010`) and cannot publish mic audio.
 
-## Phase breakdown — concrete next steps
+## Browser tab — HTTP tunnel
 
-**Phase 1 (after you've created the Xcode project, come back and I'll drop
-in Swift sources for):**
+The in-app `WKWebView` registers a handler for a custom `tunnel://` scheme.
+Every request the webview issues flows through this chain:
 
-- `TmuxAgentApp.swift` — @main.
-- `SettingsStore.swift` — Keychain-backed `@Observable` store.
-- `SettingsView.swift` — form UI.
-- `RoomConnection.swift` — LiveKit room lifecycle + JWT minting.
-- `ContentView.swift` — tabbed root: [Room view] [Settings].
-- `RoomView.swift` — renders the agent's video track + mic toggle.
+1. `TunnelSchemeHandler` serializes the `URLRequest` into an `HTTPRequest`
+   struct (method / path / query / headers / body).
+2. `ProxyClient` opens a LiveKit byte stream with topic `http.request`, writes
+   the serialized request, and awaits a matching `HTTPResponse` on the
+   `http.response` topic (correlated by UUID).
+3. The agent proxies to `PROXY_TARGET` (default `http://localhost:3000`) via
+   `aiohttp` and streams the response back.
 
-**Phase 2:**
+**Why byte streams, not RPC?** LiveKit RPC caps payloads at ~15 KB — way below a
+typical JS bundle. Byte streams have no effective cap; we've moved 900 KB+ chunks
+through them without issue.
 
-- `BrowserView.swift` — SwiftUI wrapper around `WKWebView`.
-- Tab 3: browser pointed at `tunnel://localhost/` (blank until Phase 3).
+**Why a custom `tunnel://` scheme?** `WKURLSchemeHandler` can only intercept
+custom schemes, not `http`/`https`. The webview loads `tunnel://localhost/` and
+all relative fetches stay inside `tunnel://` where we can intercept them.
+Absolute `http://localhost:3000/…` links in the page would bypass the handler;
+for Claude-built dev sites that rarely matters.
 
-**Phase 3:**
+**Caching.** The webview uses `WKWebsiteDataStore.nonPersistent()` and every
+load uses `URLRequest(cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)` so
+reload always re-fetches through the tunnel.
 
-- `TunnelScheme.swift` — `WKURLSchemeHandler` that serializes requests and
-  writes to a LiveKit byte stream, then plumbs the response back.
-- Agent side (`agent/tmux_agent.py`): register a byte-stream handler on the
-  `http.request` topic that proxies to `http://localhost:3000`. Add `aiohttp`
-  to `agent/requirements.txt`.
+## Troubleshooting
 
-## Why a custom scheme (not `http://localhost:3000` directly)
-
-`WKWebView` lets you intercept *custom* schemes with `WKURLSchemeHandler`,
-but not `http`/`https`. So the webview loads `tunnel://localhost/` and all
-relative requests stay inside `tunnel://`, where we can intercept them.
-Absolute `http://localhost:3000/...` links in the page would break unless
-we rewrite them; for Claude-built dev sites that's rarely an issue.
+- **`No such module 'LiveKit'` in Xcode's editor only** — that's SourceKit's
+  stale indexer. Build (`⌘B`) to force a rebuild of the module; the error
+  clears once the real compile succeeds.
+- **Mic toggle fails with `-4010`** — you're on the simulator. Use a physical
+  device.
+- **Browser tab shows a stale page after you edit the dev server** — hit the
+  reload button (circular arrow) next to Go. It forces a re-fetch through the
+  tunnel.
+- **Connect spinner hangs** — check the Agent tab is dispatching. The
+  mobile app only joins the room; something has to tell LiveKit to start the
+  agent job (Cloud Agents playground, or your own dispatch frontend).
