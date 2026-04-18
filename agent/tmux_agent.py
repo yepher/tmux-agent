@@ -80,8 +80,8 @@ _TRACK_SRC_STR = os.getenv("TMUX_TRACK_SOURCE", "screenshare").strip().lower()
 # Simple pipeline: RGBA frames + minimal TrackPublishOptions (no forced codec).
 # Defaults match browsing_agent browser_manager screenshare: 640×480, SOURCE_SCREENSHARE.
 COMPAT_VIDEO = os.getenv("TMUX_COMPAT_VIDEO", "1").lower() in ("1", "true", "yes")
-COMPAT_WIDTH = int(os.getenv("TMUX_COMPAT_WIDTH", "640"))
-COMPAT_HEIGHT = int(os.getenv("TMUX_COMPAT_HEIGHT", "480"))
+COMPAT_WIDTH = int(os.getenv("TMUX_COMPAT_WIDTH", "1280"))
+COMPAT_HEIGHT = int(os.getenv("TMUX_COMPAT_HEIGHT", "720"))
 # Match browsing_agent/browser_manager exactly: screenshare source, no I420 conversion.
 _COMPAT_TRACK_SRC = os.getenv("TMUX_COMPAT_TRACK_SOURCE", "screenshare").strip().lower()
 # RGBA → I420 before capture_frame. Default OFF — the browsing_agent reference
@@ -322,6 +322,40 @@ def _attrs_equal(a, b) -> bool:
     )
 
 
+def _error_html(status: int, title: str, message: str) -> bytes:
+    """Render a minimal mobile-friendly HTML error page for the proxy so that
+    WKWebView actually shows a readable error instead of blank/old content."""
+    import html as _html
+    safe_title = _html.escape(title)
+    safe_msg = _html.escape(message).replace("\n", "<br>")
+    body = (
+        f"<!doctype html><html><head><meta charset='utf-8'>"
+        f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{status} {safe_title}</title>"
+        f"<style>"
+        f"body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;"
+        f"background:#1b1b1f;color:#eee;margin:0;padding:2em;"
+        f"line-height:1.5;-webkit-text-size-adjust:none}}"
+        f".card{{max-width:600px;margin:0 auto;"
+        f"background:#2a2a30;border-radius:12px;padding:1.5em;"
+        f"border:1px solid #5c2222}}"
+        f".badge{{display:inline-block;padding:0.2em 0.6em;"
+        f"border-radius:6px;background:#b0413e;color:#fff;"
+        f"font-size:0.9em;font-weight:600;margin-bottom:0.8em}}"
+        f".title{{font-size:1.3em;margin:0 0 0.8em}}"
+        f".msg{{color:#ccc;white-space:pre-wrap;"
+        f"font-family:ui-monospace,Menlo,monospace;font-size:0.95em}}"
+        f".foot{{margin-top:1.2em;color:#888;font-size:0.82em}}"
+        f"</style></head><body><div class='card'>"
+        f"<span class='badge'>{status}</span>"
+        f"<h1 class='title'>{safe_title}</h1>"
+        f"<div class='msg'>{safe_msg}</div>"
+        f"<div class='foot'>tmux-agent proxy → {PROXY_TARGET}</div>"
+        f"</div></body></html>"
+    )
+    return body.encode("utf-8")
+
+
 async def _run_http_proxy_request(
     room: rtc.Room,
     reader: rtc.ByteStreamReader,
@@ -385,14 +419,29 @@ async def _run_http_proxy_request(
             res_body = await resp.read()
     except asyncio.TimeoutError:
         status, status_text = 504, "Gateway Timeout"
-        res_body = b"tmux-agent proxy: upstream timed out"
+        res_body = _error_html(
+            status, "Gateway Timeout",
+            f"The agent's upstream at {PROXY_TARGET} didn't respond within "
+            f"{PROXY_TIMEOUT:.0f}s.\n\nCheck that your dev server (e.g. "
+            f"npm run dev) is still running.",
+        )
+        res_headers = {"Content-Type": "text/html; charset=utf-8"}
     except aiohttp.ClientError as e:
         status, status_text = 502, "Bad Gateway"
-        res_body = f"tmux-agent proxy: {e}".encode()
+        res_body = _error_html(
+            status, "Bad Gateway",
+            f"The agent could not reach {PROXY_TARGET}.\n\n{e}\n\n"
+            f"Start something on that port (e.g. npm run dev, python -m "
+            f"http.server 3000) and refresh.",
+        )
+        res_headers = {"Content-Type": "text/html; charset=utf-8"}
     except Exception as e:  # defensive — keep the handler alive
         logger.exception("proxy request failed")
         status, status_text = 500, "Internal Server Error"
-        res_body = f"tmux-agent proxy: {e}".encode()
+        res_body = _error_html(
+            status, "Proxy Error", f"Unexpected error in the agent proxy: {e}"
+        )
+        res_headers = {"Content-Type": "text/html; charset=utf-8"}
 
     logger.info(
         "proxy %s %s -> %d (id=%s, %d bytes out)",
@@ -668,6 +717,36 @@ server = AgentServer()
 @server.rtc_session()
 async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
+
+    # Register the HTTP-proxy byte-stream handler FIRST, before video setup or
+    # anything else. If the mobile app is already in the room and fires a
+    # request as soon as the agent joins, LiveKit drops the stream with
+    # "ignoring byte stream ... no callback attached" unless the handler is
+    # attached. Shared aiohttp.ClientSession (one per entrypoint) for
+    # connection reuse.
+    http_session = aiohttp.ClientSession()
+    proxy_tasks: set[asyncio.Task[None]] = set()
+
+    def _on_proxy_request(
+        reader: rtc.ByteStreamReader, remote_identity: str
+    ) -> None:
+        task = asyncio.create_task(
+            _run_http_proxy_request(ctx.room, reader, remote_identity, http_session)
+        )
+        proxy_tasks.add(task)
+        task.add_done_callback(proxy_tasks.discard)
+
+    # Dev-mode reload can leave the prior entrypoint's handler attached to the
+    # room; unregister-then-register makes this idempotent.
+    try:
+        ctx.room.unregister_byte_stream_handler(PROXY_REQUEST_TOPIC)
+    except Exception:
+        pass
+    ctx.room.register_byte_stream_handler(PROXY_REQUEST_TOPIC, _on_proxy_request)
+    logger.info(
+        "http proxy ready: topic=%s target=%s",
+        PROXY_REQUEST_TOPIC, PROXY_TARGET,
+    )
 
     tmux = TmuxSession(TMUX_SESSION, COLS, ROWS)
     tmux.ensure()
@@ -1003,28 +1082,6 @@ async def entrypoint(ctx: JobContext) -> None:
                 raise
             except Exception:
                 logger.exception("completion watcher error")
-
-    # HTTP proxy: each request the mobile app sends arrives as its own byte
-    # stream on PROXY_REQUEST_TOPIC. Spawn a task per request so they run
-    # concurrently; the aiohttp session is shared across all of them for
-    # connection reuse.
-    http_session = aiohttp.ClientSession()
-    proxy_tasks: set[asyncio.Task[None]] = set()
-
-    def _on_proxy_request(
-        reader: rtc.ByteStreamReader, remote_identity: str
-    ) -> None:
-        task = asyncio.create_task(
-            _run_http_proxy_request(ctx.room, reader, remote_identity, http_session)
-        )
-        proxy_tasks.add(task)
-        task.add_done_callback(proxy_tasks.discard)
-
-    ctx.room.register_byte_stream_handler(PROXY_REQUEST_TOPIC, _on_proxy_request)
-    logger.info(
-        "http proxy ready: topic=%s target=%s",
-        PROXY_REQUEST_TOPIC, PROXY_TARGET,
-    )
 
     try:
         # record={"audio": False}: skip audio encoding (Opus is marked experimental in

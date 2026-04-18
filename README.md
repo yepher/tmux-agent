@@ -120,8 +120,8 @@ Publish pipeline (rarely need to touch — defaults match the verified-working p
 
 | Var | Default | Notes |
 |-----|---------|-------|
-| `TMUX_COMPAT_VIDEO` | `1` | Use the "compat" publish path (RGBA, minimal `TrackPublishOptions`, default 640×480). Set `0` to use the advanced path with codec/bitrate/framerate control. |
-| `TMUX_COMPAT_WIDTH` / `TMUX_COMPAT_HEIGHT` | `640` / `480` | Letterboxed publish size in compat mode. Bump to `1280 × 720` if text is too small. |
+| `TMUX_COMPAT_VIDEO` | `1` | Use the "compat" publish path (RGBA, minimal `TrackPublishOptions`, default 1280×720 16:9). Set `0` to use the advanced path with codec/bitrate/framerate control. |
+| `TMUX_COMPAT_WIDTH` / `TMUX_COMPAT_HEIGHT` | `1280` / `720` | Letterboxed publish size in compat mode. 16:9 matches modern widescreen displays; bump or drop for sharpness/perf. |
 | `TMUX_COMPAT_TRACK_SOURCE` | `screenshare` | Or `camera`. Compat-mode track source. |
 | `TMUX_COMPAT_I420` | `0` | RGBA → I420 conversion before publish (compat mode). |
 | `TMUX_OUT_WIDTH` / `TMUX_OUT_HEIGHT` | `1280` / `720` | Publish size when `TMUX_COMPAT_VIDEO=0`. |
@@ -163,8 +163,8 @@ The terminal-to-video pipeline has three pieces:
   `generate_reply` with an explicit English greeting; the system prompt also
   pins English.
 - **Text looks blurry in the browser** — the pane renders at 1200×720 but
-  letterboxes to 640×480 by default. Run with
-  `TMUX_COMPAT_WIDTH=1280 TMUX_COMPAT_HEIGHT=720` to keep it near 1:1.
+  letterboxes to 1024×768 (4:3) by default. Run with
+  `TMUX_COMPAT_WIDTH=1280 TMUX_COMPAT_HEIGHT=720` to keep the render near 1:1.
 - **First-frame diagnostic** — set `TMUX_DEBUG_RAW=1` to dump the raw RGBA of
   the first frame; verify it with
   `ffplay -f rawvideo -pixel_format rgba -video_size <W>x<H> /tmp/tmux_debug_first.rgba`.
