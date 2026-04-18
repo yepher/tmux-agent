@@ -25,7 +25,16 @@ so ANSI colors and attributes survive.
   text, send keys, run commands, read the screen, and switch sessions/windows.
 - **Context awareness** — the system prompt teaches the agent to distinguish a
   plain shell from Claude Code and to use the correct input mode (`send_text`
-  plus Enter inside Claude Code, `run_command` at a shell).
+  plus Enter inside Claude Code, `run_command` at a shell). It also knows
+  Claude Code's slash commands (`/init`, `/branch`, …), `!`/`@`/`&` prefixes,
+  and keybindings (`Shift-Tab`, `M-p`, `C-o`, etc.).
+- **Claude Code prompt watcher** — a background task polls the pane for the
+  standard "Do you want to proceed? 1. Yes / 2. Yes always / 3. No" permission
+  prompt and speaks the question to the user so they know to answer. The agent
+  maps "yes" / "yes always" / "no" replies to `send_text("1"|"2"|"3", enter=True)`.
+- **Claude Code completion watcher** — detects Claude Code busy→idle transitions
+  (via the "esc to interrupt" / "Thinking…" cues) and nudges the agent to read
+  the screen and summarize what Claude just did in one or two sentences.
 
 ## Requirements
 
@@ -74,6 +83,7 @@ to it; it sizes the window to `TMUX_COLS` × `TMUX_ROWS`.
 | `send_text(text, press_enter=False)` | Types literal characters; Enter is opt-in. Use for interactive prompts / Claude Code. |
 | `send_key(key)` | Sends a tmux-style key name: `Enter`, `Tab`, `Escape`, `Up`, `C-c`, `C-l`, `S-Tab`, `M-p`, … |
 | `read_screen()` | Returns the visible pane text. The agent calls this to decide what to do. |
+| `wait_for_output(seconds=2.0)` | Sleep (clamped to 0.5–10s), then return the visible pane. Use after launching slow starters (`claude`, `vim`, `npm install`, `ssh`, …) before concluding a command failed. |
 | `list_sessions()` / `switch_session(name)` | Enumerate / switch tmux sessions; creates one if missing. |
 | `list_windows()` / `switch_window(target)` | Enumerate / select windows by index or name in the current session. |
 
@@ -94,10 +104,17 @@ Publish pipeline (rarely need to touch — defaults match the verified-working p
 
 | Var | Default | Notes |
 |-----|---------|-------|
-| `TMUX_COMPAT_WIDTH` / `TMUX_COMPAT_HEIGHT` | `640` / `480` | Letterboxed publish size. Bump to `1280 × 720` if text is too small. |
-| `TMUX_COMPAT_TRACK_SOURCE` | `screenshare` | Or `camera`. |
-| `TMUX_COMPAT_I420` | `0` | RGBA → I420 conversion before publish. |
+| `TMUX_COMPAT_VIDEO` | `1` | Use the "compat" publish path (RGBA, minimal `TrackPublishOptions`, default 640×480). Set `0` to use the advanced path with codec/bitrate/framerate control. |
+| `TMUX_COMPAT_WIDTH` / `TMUX_COMPAT_HEIGHT` | `640` / `480` | Letterboxed publish size in compat mode. Bump to `1280 × 720` if text is too small. |
+| `TMUX_COMPAT_TRACK_SOURCE` | `screenshare` | Or `camera`. Compat-mode track source. |
+| `TMUX_COMPAT_I420` | `0` | RGBA → I420 conversion before publish (compat mode). |
+| `TMUX_OUT_WIDTH` / `TMUX_OUT_HEIGHT` | `1280` / `720` | Publish size when `TMUX_COMPAT_VIDEO=0`. |
+| `TMUX_VIDEO_CODEC` | `h264` | Non-compat path only. One of `h264`, `h265`/`hevc`, `vp8`, `vp9`, `av1`. |
+| `TMUX_TRACK_SOURCE` | `screenshare` | Non-compat track source (`screenshare` or `camera`). |
+| `TMUX_USE_I420` | `0` | Non-compat: RGB24 → I420 conversion before publish. |
+| `TMUX_SCREENCAST` | `0` | Non-compat: set `is_screencast=True` on the `VideoSource` (enables LiveKit screencast heuristics). |
 | `TMUX_STREAM_STATIC_PNG` | `0` | Publish `res/static_share.png` instead of tmux — pipeline diagnostic. |
+| `TMUX_STATIC_IMAGE` | `res/static_share.png` | Path to the PNG used when `TMUX_STREAM_STATIC_PNG=1`. |
 | `TMUX_TEST_MODE` | `0` | Publish a colored test card instead of tmux. |
 | `TMUX_DEBUG_RAW` | `0` | Dump first frame to `/tmp/tmux_debug_first.rgba` for `ffplay` verification. |
 

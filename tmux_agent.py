@@ -311,6 +311,58 @@ def _attrs_equal(a, b) -> bool:
     )
 
 
+def _is_claude_busy(screen: str) -> bool:
+    """Heuristic: is Claude Code currently processing a request?
+
+    Claude Code shows an "esc to interrupt" cue (and/or a Thinking/Running
+    spinner) while working; the cue disappears once it returns to the idle
+    `>` prompt.
+    """
+    low = screen.lower()
+    return (
+        "esc to interrupt" in low
+        or "thinking…" in low
+        or "thinking..." in low
+        or "running…" in low
+        or "running..." in low
+    )
+
+
+def _detect_claude_prompt(lines: list[str]) -> str | None:
+    """Return the question + options when the pane shows a Claude Code
+    confirmation prompt, else None.
+
+    Shape:
+        Do you want to proceed?
+        ❯ 1. Yes
+          2. Yes, and don't ask again …
+          3. No, tell Claude what to do differently
+    """
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if not (low.startswith("do you want") or low.startswith("would you like")):
+            continue
+        # Scan a small window for the "1. Yes" / "3. No" markers.
+        has_yes = False
+        has_no = False
+        context = [line]
+        for follow in lines[i + 1 : i + 10]:
+            s = follow.strip().lstrip("❯›>•").strip()
+            if not s:
+                continue
+            context.append(s)
+            if s.startswith("1.") and "yes" in s.lower():
+                has_yes = True
+            if s.startswith("3.") and "no" in s.lower():
+                has_no = True
+        if has_yes and has_no:
+            return "\n".join(context[:4])
+    return None
+
+
 def _load_static_share_image(out_w: int, out_h: int) -> Image.Image:
     """Load TMUX_STATIC_IMAGE (PNG), RGBA, letterboxed to out_w×out_h."""
     path = Path(TMUX_STATIC_IMAGE).expanduser()
@@ -410,17 +462,42 @@ Always speak and respond in English, regardless of what language the user speaks
 - `send_key` for named keys: `Enter`, `Tab`, `Escape`, `Up`/`Down`/`Left`/`Right`,
   `C-c` (Ctrl+C), `C-d`, `C-l` (clear), `M-p` (Alt+p), etc.
 - `read_screen` to read what's currently visible before deciding what to do.
+- `wait_for_output(seconds)` after launching something that takes time to render
+  (`claude`, `vim`, `less`, `htop`, `nano`, `npm install`, `ssh`, `docker build`, …).
+  Default 2s; bump to 4-6s for heavier startups. **Do not conclude a command failed
+  from a single quick read_screen** — prefer `wait_for_output` first.
 
 ## Context awareness — shell vs Claude Code
 Before acting, check the screen. You are in one of two modes:
 
-**Plain shell** — prompt ends in `$`, `%`, `#`, or `>`. Use `run_command` freely.
+**Plain shell** — prompt ends in `$`, `%`, `#`, or `>`. Use `run_command` freely
+and answer the user's question yourself from the terminal output.
 
-**Claude Code** (an interactive coding assistant running in the pane) — telltale signs:
-prompt starts with `>`; hint line like `? for shortcuts`; slash-command menu visible;
-mentions of `/init`, `/agents`, `/branch`, etc. When in Claude Code, DO NOT use
-`run_command` to send shell commands — they'd be typed as Claude Code prompts.
-Instead use `send_text` to type a prompt, then `send_key("Enter")` to submit.
+**Claude Code** (an interactive coding assistant running in the pane) — telltale
+signs: prompt starts with `>`; hint line like `? for shortcuts`; slash-command menu
+visible; mentions of `/init`, `/agents`, `/branch`, etc.
+
+When in Claude Code mode your role is a **voice-to-Claude-Code proxy**, not an
+assistant that answers on your own:
+
+- Forward the user's request to Claude Code by typing it with
+  `send_text(..., press_enter=True)`. Use the user's own wording — you may clean
+  up obvious speech-to-text artifacts ("um", stutters), but do NOT rephrase,
+  expand, or add preamble like "Sure, let me look at…". Keep it terse, like the
+  user typed it.
+- Do NOT answer the request yourself from `read_screen` output. Claude Code is
+  the one answering. You only carry the message and, after it runs, describe
+  briefly in one sentence what Claude Code did or is waiting on.
+- Do NOT use `run_command` in this mode — it would send a shell command line,
+  but you're not at a shell; the text would become a Claude Code prompt.
+- Meta-requests about the terminal itself — "exit Claude", "clear the screen",
+  "switch sessions", "what shortcut is that" — you handle directly (tools or
+  answering). Don't forward those to Claude Code.
+  - "exit Claude" / "quit Claude" / "close Claude" → `send_text("exit", press_enter=True)`.
+    Do NOT use `send_key("C-c")` — Ctrl+C interrupts the current response but
+    leaves Claude running; typing `exit` is the clean way out.
+- If the user's request is ambiguous (task vs meta), ask one short clarifying
+  question before typing anything.
 
 ### Claude Code input conventions (use `send_text`, then Enter)
 - `!<cmd>` — run shell in Claude Code's bash mode (e.g. `!ls -la`)
@@ -439,6 +516,21 @@ Instead use `send_text` to type a prompt, then `send_key("Enter")` to submit.
 - `C-g` — edit in $EDITOR
 - `M-p` — switch model
 - `S-Enter` — newline within prompt (`send_key("S-Enter")`)
+
+## Answering Claude Code confirmation prompts
+When Claude Code asks a permission question, the screen shows a line like
+"Do you want to proceed?" followed by:
+  1. Yes
+  2. Yes, and don't ask again …
+  3. No, tell Claude what to do differently
+
+A background watcher notifies the user automatically when it sees such a prompt.
+When the user responds, answer with `send_text` of the option number and Enter:
+- user says "yes" → `send_text("1", press_enter=True)`
+- user says "yes always" / "don't ask again" / "always" → `send_text("2", press_enter=True)`
+- user says "no" / "cancel" / "stop" → `send_text("3", press_enter=True)`
+If the user gives guidance to pass to Claude instead of a numeric choice, choose
+option 3 and then send their guidance via `send_text(..., press_enter=True)`.
 
 ## Style
 Narrate briefly what you're about to do (one short sentence), then run it. After it
@@ -648,6 +740,24 @@ async def entrypoint(ctx: JobContext) -> None:
         return "\n".join(tmux.capture_plain())
 
     @function_tool
+    async def wait_for_output(seconds: float = 2.0) -> str:
+        """Wait, then return the visible pane contents.
+
+        Use this after launching a program that takes a moment to start or
+        render (claude, vim, less, htop, top, nano, npm/pip install, ssh,
+        docker build, etc.) so the UI has time to appear before you decide
+        whether it worked. Do NOT immediately conclude a command failed if
+        the first `read_screen` looks empty — wait and check again.
+
+        Args:
+            seconds: How long to wait, clamped to [0.5, 10].
+        """
+        s = max(0.5, min(seconds, 10.0))
+        logger.info("wait_for_output: sleeping %.2fs", s)
+        await asyncio.sleep(s)
+        return "\n".join(tmux.capture_plain())
+
+    @function_tool
     async def list_sessions() -> str:
         """List all tmux sessions on the host. The current session is marked with '*'."""
         sessions = tmux.list_sessions()
@@ -696,6 +806,7 @@ async def entrypoint(ctx: JobContext) -> None:
             send_text,
             send_key,
             read_screen,
+            wait_for_output,
             list_sessions,
             switch_session,
             list_windows,
@@ -705,10 +816,90 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session = AgentSession(llm=openai.realtime.RealtimeModel())
 
+    async def _watch_claude_prompts() -> None:
+        """Poll the pane for Claude Code confirmation prompts and speak up.
+
+        Matches a "Do you want …" / "Would you like …" question followed by
+        a "1. Yes" / "3. No" option list — the standard Claude Code permission
+        prompt shape. Announces each new prompt exactly once via session.say,
+        so the user knows to respond. The agent's own prompt instructions tell
+        it how to turn the user's reply into send_text("1"|"2"|"3", enter=True).
+        """
+        last_seen: str | None = None
+        while True:
+            await asyncio.sleep(0.8)
+            try:
+                lines = tmux.capture_plain()
+                prompt = _detect_claude_prompt(lines)
+                if prompt and prompt != last_seen:
+                    last_seen = prompt
+                    logger.info("claude-code prompt detected: %s", prompt)
+                    question = prompt.splitlines()[0].strip()
+                    # Realtime session doesn't support say(); use generate_reply
+                    # with explicit instructions so the LLM voices the prompt.
+                    session.generate_reply(
+                        instructions=(
+                            "Claude Code is waiting for a yes/no decision from "
+                            f"the user. The question on screen is: '{question}'. "
+                            "Briefly tell the user what Claude is asking and ask "
+                            "whether to answer yes, yes always, or no. Do not "
+                            "call any tools yet — wait for the user's reply, "
+                            "then use send_text('1'|'2'|'3', press_enter=True) "
+                            "to answer."
+                        )
+                    )
+                elif not prompt:
+                    last_seen = None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("prompt watcher error")
+
+    async def _watch_claude_completion() -> None:
+        """Detect Claude Code busy→idle transitions and nudge the agent to
+        summarize. Only fires after Claude was busy for ≥1.5s so brief internal
+        idles between tool calls don't spam. 3s cooldown between fires.
+        """
+        busy_since: float | None = None
+        last_fired: float = 0.0
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(1.0)
+            try:
+                screen = "\n".join(tmux.capture_plain())
+                now = loop.time()
+                if _is_claude_busy(screen):
+                    if busy_since is None:
+                        busy_since = now
+                elif busy_since is not None:
+                    duration = now - busy_since
+                    busy_since = None
+                    if duration >= 1.5 and now - last_fired >= 3.0:
+                        last_fired = now
+                        logger.info(
+                            "claude-code finished after %.1fs busy", duration
+                        )
+                        session.generate_reply(
+                            instructions=(
+                                "Claude Code just finished responding in the "
+                                "terminal the user can see. Call read_screen, "
+                                "then briefly tell the user (1-2 sentences) what "
+                                "Claude did or concluded. If Claude is asking a "
+                                "question, relay the question and ask the user "
+                                "how they'd like to answer."
+                            )
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("completion watcher error")
+
     try:
         # record={"audio": False}: skip audio encoding (Opus is marked experimental in
         # the bundled ffmpeg and breaks recorder_io); keep traces/logs/transcripts.
         await session.start(agent=agent, room=ctx.room, record={"audio": False})
+        prompt_task = asyncio.create_task(_watch_claude_prompts())
+        completion_task = asyncio.create_task(_watch_claude_completion())
         # session.start returns after setup; the session runs on its own tasks.
         # We must keep the entrypoint coroutine alive (matches
         # livekit_info/examples/browsing_agent/main.py pattern) or the framework
@@ -717,6 +908,9 @@ async def entrypoint(ctx: JobContext) -> None:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             pass
+        finally:
+            prompt_task.cancel()
+            completion_task.cancel()
     finally:
         video_task.cancel()
 
