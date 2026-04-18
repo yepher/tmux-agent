@@ -1,1 +1,51 @@
-__pycache__
+__pycache__/
+.venv/
+.env
+.DS_Store
+
+# ----- iOS / Xcode -----
+
+# Xcode per-user state (breakpoints, window layout, schemes you chose "Shared" for stay)
+**/xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+
+# Build outputs
+DerivedData/
+**/build/
+**/.build/
+
+# Swift Package Manager per-user
+.swiftpm/xcode/xcuserdata/
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+
+# Compiled artifacts / packaging
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+*.moved-aside
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# Locally-cloned LiveKit SDK (attached as a SwiftPM local package — external repo,
+# must not be vendored into this repo).
+ios/client-sdk-swift/
+
+# Third-party package managers we don't currently use, but future-proof.
+Pods/
+Carthage/Build/
+
+# fastlane, if it shows up later.
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output/

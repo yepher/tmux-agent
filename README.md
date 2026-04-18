@@ -36,6 +36,20 @@ so ANSI colors and attributes survive.
   (via the "esc to interrupt" / "Thinking…" cues) and nudges the agent to read
   the screen and summarize what Claude just did in one or two sentences.
 
+## Layout
+
+```
+tmux_agent/
+├── README.md           ← you are here
+├── agent/              ← the Python voice agent (server)
+│   ├── tmux_agent.py
+│   ├── requirements.txt
+│   ├── .env.example
+│   └── res/static_share.png
+└── ios/                ← custom iOS client (WKWebView + HTTP tunnel over LiveKit)
+    └── README.md       ← plan / Xcode setup steps
+```
+
 ## Requirements
 
 - macOS or Linux with `tmux` on `$PATH`.
@@ -46,14 +60,14 @@ so ANSI colors and attributes survive.
 ## Setup
 
 ```bash
-cd tmux_agent
+cd agent
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # fill in creds
 ```
 
-Required in `.env`:
+Required in `agent/.env`:
 
 ```
 LIVEKIT_URL=wss://...
@@ -63,6 +77,8 @@ OPENAI_API_KEY=...
 ```
 
 ## Run
+
+From `agent/` with the venv activated:
 
 ```bash
 python tmux_agent.py dev     # hot-reload, connects to LiveKit
