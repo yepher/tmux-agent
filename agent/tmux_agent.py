@@ -8,6 +8,7 @@ tmux via `capture-pane -e`.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -15,6 +16,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import aiohttp
 import numpy as np
 import pyte
 from dotenv import load_dotenv
@@ -42,6 +44,15 @@ STREAM_STATIC_PNG = os.getenv("TMUX_STREAM_STATIC_PNG", "0").strip().lower() in 
     "true",
     "yes",
 )
+
+# HTTP proxy: the iOS app tunnels WKWebView requests to us over a LiveKit
+# byte stream; we re-issue them against this base URL on the agent's machine
+# and stream the response back. Typical use: Claude runs a dev server on
+# localhost:3000 and the phone views it through the tunnel.
+PROXY_TARGET = os.getenv("TMUX_PROXY_TARGET", "http://localhost:3000").rstrip("/")
+PROXY_REQUEST_TOPIC = os.getenv("TMUX_PROXY_REQ_TOPIC", "http.request")
+PROXY_RESPONSE_TOPIC = os.getenv("TMUX_PROXY_RES_TOPIC", "http.response")
+PROXY_TIMEOUT = float(os.getenv("TMUX_PROXY_TIMEOUT", "30"))
 
 TMUX_SESSION = os.getenv("TMUX_SESSION_NAME", "agent")
 COLS = int(os.getenv("TMUX_COLS", "100"))
@@ -309,6 +320,105 @@ def _attrs_equal(a, b) -> bool:
         and a.reverse == b.reverse
         and a.underscore == b.underscore
     )
+
+
+async def _run_http_proxy_request(
+    room: rtc.Room,
+    reader: rtc.ByteStreamReader,
+    remote_identity: str,
+    http: aiohttp.ClientSession,
+) -> None:
+    """Handle a single proxied HTTP request from the mobile app.
+
+    Wire format (see ios/README.md):
+      Request stream attributes:
+        id, method, path, headers (json dict string)
+        Stream body: request body bytes (possibly empty).
+      Response stream attributes:
+        id, status, status_text, headers (json dict string)
+        Stream body: response body bytes.
+    """
+    attrs = dict(reader.info.attributes or {})
+    req_id = attrs.get("id", reader.info.stream_id)
+    method = attrs.get("method", "GET").upper()
+    path = attrs.get("path", "/")
+    try:
+        headers = json.loads(attrs.get("headers", "{}") or "{}")
+    except json.JSONDecodeError:
+        headers = {}
+
+    # Drain the request body from the stream.
+    body_chunks: list[bytes] = []
+    async for chunk in reader:
+        body_chunks.append(chunk)
+    body = b"".join(body_chunks) if body_chunks else None
+
+    url = f"{PROXY_TARGET}{path if path.startswith('/') else '/' + path}"
+    logger.info(
+        "proxy %s %s (id=%s, %d bytes in)", method, url, req_id, len(body or b"")
+    )
+
+    # Strip hop-by-hop headers that aiohttp manages itself.
+    hop = {"host", "connection", "content-length", "transfer-encoding"}
+    fwd_headers = {k: v for k, v in headers.items() if k.lower() not in hop}
+
+    status = 502
+    status_text = "Bad Gateway"
+    res_headers: dict[str, str] = {}
+    res_body = b""
+    try:
+        async with http.request(
+            method,
+            url,
+            headers=fwd_headers,
+            data=body,
+            allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=PROXY_TIMEOUT),
+        ) as resp:
+            status = resp.status
+            status_text = resp.reason or ""
+            # Drop hop-by-hop response headers; the app's URL scheme handler
+            # fabricates Content-Length from the body it receives.
+            res_headers = {
+                k: v for k, v in resp.headers.items() if k.lower() not in hop
+            }
+            res_body = await resp.read()
+    except asyncio.TimeoutError:
+        status, status_text = 504, "Gateway Timeout"
+        res_body = b"tmux-agent proxy: upstream timed out"
+    except aiohttp.ClientError as e:
+        status, status_text = 502, "Bad Gateway"
+        res_body = f"tmux-agent proxy: {e}".encode()
+    except Exception as e:  # defensive — keep the handler alive
+        logger.exception("proxy request failed")
+        status, status_text = 500, "Internal Server Error"
+        res_body = f"tmux-agent proxy: {e}".encode()
+
+    logger.info(
+        "proxy %s %s -> %d (id=%s, %d bytes out)",
+        method, url, status, req_id, len(res_body),
+    )
+
+    writer = await room.local_participant.stream_bytes(
+        name=f"response-{req_id}",
+        topic=PROXY_RESPONSE_TOPIC,
+        destination_identities=[remote_identity],
+        attributes={
+            "id": req_id,
+            "status": str(status),
+            "status_text": status_text,
+            "headers": json.dumps(res_headers),
+        },
+        total_size=len(res_body),
+        mime_type=res_headers.get(
+            "Content-Type", "application/octet-stream"
+        ).split(";")[0].strip(),
+    )
+    try:
+        if res_body:
+            await writer.write(res_body)
+    finally:
+        await writer.aclose()
 
 
 def _is_claude_busy(screen: str) -> bool:
@@ -894,6 +1004,28 @@ async def entrypoint(ctx: JobContext) -> None:
             except Exception:
                 logger.exception("completion watcher error")
 
+    # HTTP proxy: each request the mobile app sends arrives as its own byte
+    # stream on PROXY_REQUEST_TOPIC. Spawn a task per request so they run
+    # concurrently; the aiohttp session is shared across all of them for
+    # connection reuse.
+    http_session = aiohttp.ClientSession()
+    proxy_tasks: set[asyncio.Task[None]] = set()
+
+    def _on_proxy_request(
+        reader: rtc.ByteStreamReader, remote_identity: str
+    ) -> None:
+        task = asyncio.create_task(
+            _run_http_proxy_request(ctx.room, reader, remote_identity, http_session)
+        )
+        proxy_tasks.add(task)
+        task.add_done_callback(proxy_tasks.discard)
+
+    ctx.room.register_byte_stream_handler(PROXY_REQUEST_TOPIC, _on_proxy_request)
+    logger.info(
+        "http proxy ready: topic=%s target=%s",
+        PROXY_REQUEST_TOPIC, PROXY_TARGET,
+    )
+
     try:
         # record={"audio": False}: skip audio encoding (Opus is marked experimental in
         # the bundled ffmpeg and breaks recorder_io); keep traces/logs/transcripts.
@@ -912,6 +1044,10 @@ async def entrypoint(ctx: JobContext) -> None:
             prompt_task.cancel()
             completion_task.cancel()
     finally:
+        ctx.room.unregister_byte_stream_handler(PROXY_REQUEST_TOPIC)
+        for t in list(proxy_tasks):
+            t.cancel()
+        await http_session.close()
         video_task.cancel()
 
 
