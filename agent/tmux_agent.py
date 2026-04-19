@@ -13,10 +13,20 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli
-from livekit.agents import llm
+from livekit.agents import (
+    Agent,
+    AgentServer,
+    AgentSession,
+    JobContext,
+    JobProcess,
+    TurnHandlingOptions,
+    cli,
+    inference,
+    llm,
+)
 from livekit.agents.llm import function_tool
-from livekit.plugins import openai
+from livekit.plugins import silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from rtc_control import RtcControl
 from rtc_proxy import RtcProxy
@@ -203,7 +213,17 @@ class TmuxAgent(Agent):
         )
 
 
-server = AgentServer()
+def _prewarm(proc: JobProcess) -> None:
+    """Load Silero VAD once per worker process before any jobs run.
+
+    The model download + initial load takes a second or two; paying it up
+    front means every job's `AgentSession` starts with a ready VAD. The
+    session references this via `vad=ctx.proc.userdata["vad"]`.
+    """
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+server = AgentServer(setup_fnc=_prewarm)
 
 
 @server.rtc_session()
@@ -393,7 +413,34 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     session = AgentSession(
-        llm=openai.realtime.RealtimeModel()
+        # llm=openai.realtime.RealtimeModel()
+         stt=inference.STT("deepgram/nova-3", language="multi"),
+        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
+        # See all available models at https://docs.livekit.io/agents/models/llm/
+        llm=inference.LLM("openai/gpt-4.1-mini"),
+        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
+        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
+        tts=inference.TTS("cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
+        vad=ctx.proc.userdata["vad"],
+        turn_handling=TurnHandlingOptions(
+            # VAD + turn detection decide when the user is done speaking and
+            # when the agent should respond. See
+            # https://docs.livekit.io/agents/build/turns
+            turn_detection=MultilingualModel(),
+            interruption={
+                # Background noise can fire false-positive interruptions;
+                # when that happens, resume the agent's speech.
+                "resume_false_interruption": True,
+                "false_interruption_timeout": 1.0,
+            },
+            # Let the LLM start generating a response while we're still
+            # waiting for end-of-turn confirmation. Docs:
+            # https://docs.livekit.io/agents/build/audio/#preemptive-generation
+            preemptive_generation={"enabled": True},
+        ),
+        # Block interruptions briefly after the agent starts speaking so
+        # the client has time to calibrate AEC.
+        aec_warmup_duration=3.0,
     )
 
     # Shared state for the Claude-Code watchers so the session-change

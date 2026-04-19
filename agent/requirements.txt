@@ -1,4 +1,7 @@
-livekit-agents[openai]~=1.4
+livekit-agents[silero,turn-detector]~=1.4
+# torch is a transitive dep of the turn-detector plugin but isn't pinned
+# in its extras, so we declare it explicitly.
+torch
 python-dotenv
 Pillow
 pyte
