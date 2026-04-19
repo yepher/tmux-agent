@@ -187,7 +187,7 @@ class VideoPublisher:
         self._task.cancel()
         try:
             await self._task
-        except (asyncio.CancelledError, Exception):
+        except (asyncio.CancelledError, Exception):  # pylint: disable=broad-exception-caught
             pass
         self._task = None
 
@@ -210,7 +210,7 @@ class VideoPublisher:
                     if img.mode != "RGBA":
                         img = img.convert("RGBA")
                     np.copyto(self._view, np.asarray(img, dtype=np.uint8))
-                except Exception as e:
+                except Exception as e:  # pylint: disable=broad-exception-caught
                     # Don't kill the stream on transient frame-source errors
                     # (e.g. user typed `exit` and the tmux session died).
                     # Reuse the previous buffer contents so the last frame

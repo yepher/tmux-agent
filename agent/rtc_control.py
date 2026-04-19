@@ -68,7 +68,7 @@ class RtcControl:
         for method in (METHOD_LIST, METHOD_SWITCH):
             try:
                 lp.unregister_rpc_method(method)
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 pass
         lp.register_rpc_method(METHOD_LIST, self._handle_list)
         lp.register_rpc_method(METHOD_SWITCH, self._handle_switch)
@@ -81,11 +81,13 @@ class RtcControl:
         for method in (METHOD_LIST, METHOD_SWITCH):
             try:
                 lp.unregister_rpc_method(method)
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 pass
 
     # --- handlers --------------------------------------------------------
 
+    # pylint: disable=unused-argument
+    # (LiveKit's RPC signature passes `data` to all handlers; we only use it in _handle_switch.)
     async def _handle_list(self, data: rtc.RpcInvocationData) -> str:
         current = self._tmux.session_name
         sessions = self._tmux.list_sessions()
@@ -111,7 +113,7 @@ class RtcControl:
         try:
             self._tmux.switch_session(name)
             logger.info("rpc sessions.switch: now on %s", name)
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             logger.exception("rpc sessions.switch failed")
             return json.dumps({"ok": False, "error": str(e)})
 
@@ -121,10 +123,11 @@ class RtcControl:
         cb = self.on_session_change
         if cb is not None:
             try:
-                result = cb(name)
-                if inspect.isawaitable(result):
-                    asyncio.create_task(_suppress(result))
-            except Exception:
+                if inspect.iscoroutinefunction(cb):
+                    asyncio.create_task(_suppress(cb(name)))
+                else:
+                    cb(name)
+            except Exception:  # pylint: disable=broad-exception-caught
                 logger.exception("session-change callback failed")
 
         return json.dumps({"ok": True, "current": name})
@@ -133,5 +136,5 @@ class RtcControl:
 async def _suppress(awaitable: Awaitable[None]) -> None:
     try:
         await awaitable
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         logger.exception("async session-change callback failed")

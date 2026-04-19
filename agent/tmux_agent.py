@@ -14,6 +14,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli
+from livekit.agents import llm
 from livekit.agents.llm import function_tool
 from livekit.plugins import openai
 
@@ -395,28 +396,55 @@ async def entrypoint(ctx: JobContext) -> None:
         llm=openai.realtime.RealtimeModel()
     )
 
-    # When the iOS session dropdown switches sessions, the RPC handler
-    # flips TmuxHelper's active session without telling the voice agent.
-    # Nudge the LLM to (a) re-check the pane and (b) DROP any pending
-    # action from the prior session — otherwise it happily types the
-    # previous user request into a shell that doesn't understand it.
-    def _on_session_change(new_name: str) -> None:
+    # Shared state for the Claude-Code watchers so the session-change
+    # callback can reset them (force re-detection against the new pane).
+    watcher_state = {
+        "last_prompt": None,  # type: str | None
+        "busy_since": None,   # type: float | None
+        "last_fired": 0.0,
+    }
+
+    # When the iOS session dropdown switches sessions, the RPC handler has
+    # already flipped TmuxHelper's active session. We:
+    #   1. interrupt the agent's in-flight speech/tool,
+    #   2. clear its conversation history back to just the system prompt,
+    #   3. seed a fresh user-role context message with recent scrollback,
+    #   4. reset the Claude-Code watchers so any pending prompt in the
+    #      new session gets re-announced on the next poll (~0.8s),
+    #   5. emit a short "switched to X" acknowledgment.
+    async def _on_session_change(new_name: str) -> None:
         logger.info("agent nudge: session switched to %s", new_name)
+        try:
+            await session.interrupt(force=True)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("session.interrupt failed")
+
+        try:
+            fresh_ctx = llm.ChatContext()
+            scrollback = tmux.capture_scrollback(300).strip()
+            if scrollback:
+                fresh_ctx.add_message(
+                    role="user",
+                    content=(
+                        f"[context] Just switched to tmux session "
+                        f"'{new_name}'. Recent pane + scrollback (most "
+                        f"recent at bottom):\n{scrollback}"
+                    ),
+                )
+            await agent.update_chat_ctx(fresh_ctx)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("update_chat_ctx failed")
+
+        # Reset watchers so they treat the new session as fresh.
+        watcher_state["last_prompt"] = None
+        watcher_state["busy_since"] = None
+
         session.generate_reply(
             instructions=(
-                f"The user just switched to the tmux session '{new_name}' "
-                "via the mobile UI. CRITICAL: any request the user made "
-                "BEFORE this switch is now stale and must be DROPPED. Do "
-                "NOT type, send, or execute anything related to the prior "
-                "context — the new session is a different environment with "
-                "possibly different programs running. "
-                "Call `read_screen` now to see what's actually on this "
-                "session. Detect whether it's a shell prompt or Claude "
-                "Code. Then say ONE short sentence describing what's on "
-                "screen — e.g. 'You're at a shell prompt in that session' "
-                "or 'Claude Code is running there'. Do NOT ask a follow-up "
-                "and do NOT run any tools other than `read_screen`. Wait "
-                "for the user to direct the next action."
+                f"Briefly say exactly 'switched to {new_name}'. Nothing "
+                "else, no tool calls, no follow-up. The prompt watcher "
+                "will separately announce any Claude question that's "
+                "waiting."
             )
         )
 
@@ -427,18 +455,18 @@ async def entrypoint(ctx: JobContext) -> None:
 
         Matches a "Do you want …" / "Would you like …" question followed by
         a "1. Yes" / "3. No" option list — the standard Claude Code permission
-        prompt shape. Announces each new prompt exactly once via session.say,
-        so the user knows to respond. The agent's own prompt instructions tell
-        it how to turn the user's reply into send_text("1"|"2"|"3", enter=True).
+        prompt shape. Announces each new prompt exactly once so the user
+        knows to respond. Shares `watcher_state` with the session-change
+        callback so a switch resets detection and any prompt already on
+        screen in the new session is announced on the next tick.
         """
-        last_seen: str | None = None
         while True:
             await asyncio.sleep(0.8)
             try:
                 lines = tmux.capture_lines()
                 prompt = TmuxHelper.detect_claude_prompt(lines)
-                if prompt and prompt != last_seen:
-                    last_seen = prompt
+                if prompt and prompt != watcher_state["last_prompt"]:
+                    watcher_state["last_prompt"] = prompt
                     logger.info("claude-code prompt detected: %s", prompt)
                     question = prompt.splitlines()[0].strip()
                     # Realtime session doesn't support say(); use generate_reply
@@ -455,10 +483,8 @@ async def entrypoint(ctx: JobContext) -> None:
                         )
                     )
                 elif not prompt:
-                    last_seen = None
-            except asyncio.CancelledError:
-                raise
-            except Exception:
+                    watcher_state["last_prompt"] = None
+            except Exception:  # pylint: disable=broad-exception-caught
                 logger.exception("prompt watcher error")
 
     async def _watch_claude_completion() -> None:
@@ -466,8 +492,6 @@ async def entrypoint(ctx: JobContext) -> None:
         summarize. Only fires after Claude was busy for ≥1.5s so brief internal
         idles between tool calls don't spam. 3s cooldown between fires.
         """
-        busy_since: float | None = None
-        last_fired: float = 0.0
         loop = asyncio.get_event_loop()
         while True:
             await asyncio.sleep(1.0)
@@ -475,13 +499,13 @@ async def entrypoint(ctx: JobContext) -> None:
                 screen = tmux.capture_text()
                 now = loop.time()
                 if TmuxHelper.is_claude_busy(screen):
-                    if busy_since is None:
-                        busy_since = now
-                elif busy_since is not None:
-                    duration = now - busy_since
-                    busy_since = None
-                    if duration >= 1.5 and now - last_fired >= 3.0:
-                        last_fired = now
+                    if watcher_state["busy_since"] is None:
+                        watcher_state["busy_since"] = now
+                elif watcher_state["busy_since"] is not None:
+                    duration = now - watcher_state["busy_since"]
+                    watcher_state["busy_since"] = None
+                    if duration >= 1.5 and now - watcher_state["last_fired"] >= 3.0:
+                        watcher_state["last_fired"] = now
                         logger.info(
                             "claude-code finished after %.1fs busy", duration
                         )
@@ -495,9 +519,7 @@ async def entrypoint(ctx: JobContext) -> None:
                                 "how they'd like to answer."
                             )
                         )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 logger.exception("completion watcher error")
 
     # End the job when the last remote participant leaves. Without this, the
@@ -505,7 +527,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # pushing video frames into an empty room.
     exit_event = asyncio.Event()
 
-    def _on_participant_disconnected(_: rtc.RemoteParticipant) -> None:
+    def _on_participant_disconnected(_participant) -> None:
         if len(ctx.room.remote_participants) == 0:
             logger.info("last participant left — ending job")
             exit_event.set()

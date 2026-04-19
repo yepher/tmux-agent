@@ -106,7 +106,7 @@ class RtcProxy:
         self._http = aiohttp.ClientSession()
         try:
             room.unregister_byte_stream_handler(self.request_topic)
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             pass
         room.register_byte_stream_handler(self.request_topic, self._on_request)
         logger.info(
@@ -120,7 +120,7 @@ class RtcProxy:
         if self._room is not None:
             try:
                 self._room.unregister_byte_stream_handler(self.request_topic)
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 pass
         for t in list(self._tasks):
             t.cancel()
@@ -212,7 +212,7 @@ class RtcProxy:
                 self.target,
             )
             res_headers = {"Content-Type": "text/html; charset=utf-8"}
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             logger.exception("proxy request failed")
             status, status_text = 500, "Internal Server Error"
             res_body = _error_html(
