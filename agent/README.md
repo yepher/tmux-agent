@@ -120,7 +120,6 @@ Publish pipeline (rarely need to touch — defaults match the verified-working p
 | `TMUX_SCREENCAST` | `0` | Non-compat: set `is_screencast=True` on the `VideoSource` (enables LiveKit screencast heuristics). |
 | `TMUX_STREAM_STATIC_PNG` | `0` | Publish `res/static_share.png` instead of tmux — pipeline diagnostic. |
 | `TMUX_STATIC_IMAGE` | `res/static_share.png` | Path to the PNG used when `TMUX_STREAM_STATIC_PNG=1`. |
-| `TMUX_TEST_MODE` | `0` | Publish a colored test card instead of tmux. |
 | `TMUX_DEBUG_RAW` | `0` | Dump first frame to `/tmp/tmux_debug_first.rgba` for `ffplay` verification. |
 
 ## Architecture notes

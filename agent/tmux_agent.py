@@ -12,16 +12,14 @@ import logging
 import os
 from pathlib import Path
 
-import numpy as np
 from dotenv import load_dotenv
-from livekit import rtc
 from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli
 from livekit.agents.llm import function_tool
 from livekit.plugins import openai
-from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from rtc_proxy import RtcProxy
-from tmux_helper import DEFAULT_BG, TmuxHelper, find_font
+from tmux_helper import TmuxHelper
+from video_publisher import VideoPublisher, load_static_png
 
 load_dotenv()
 
@@ -30,140 +28,16 @@ logger.setLevel(logging.INFO)
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _DEFAULT_STATIC_PNG = _SCRIPT_DIR / "res" / "static_share.png"
-# Absolute or relative path to a PNG to stream (isolates WebRTC from tmux rendering).
 TMUX_STATIC_IMAGE = os.getenv("TMUX_STATIC_IMAGE", str(_DEFAULT_STATIC_PNG))
-# 1 = stream only the PNG (padded to OUT_WIDTH×OUT_HEIGHT). 0 = live tmux. Empty = auto
-# (use bundled res/static_share.png when that file exists).
-# Default OFF — set TMUX_STREAM_STATIC_PNG=1 to publish the bundled PNG
-# instead of live tmux. Used only as a publish-pipeline diagnostic.
+# Diagnostic: stream a static PNG instead of the live tmux pane.
 STREAM_STATIC_PNG = os.getenv("TMUX_STREAM_STATIC_PNG", "0").strip().lower() in (
-    "1",
-    "true",
-    "yes",
+    "1", "true", "yes",
 )
 
 TMUX_SESSION = os.getenv("TMUX_SESSION_NAME", "agent")
 COLS = int(os.getenv("TMUX_COLS", "100"))
 ROWS = int(os.getenv("TMUX_ROWS", "30"))
 FONT_SIZE = int(os.getenv("TMUX_FONT_SIZE", "20"))
-FPS = int(os.getenv("TMUX_FPS", "10"))
-MAX_BITRATE = int(os.getenv("TMUX_MAX_BITRATE", "8000000"))
-# When set, publish a synthetic test card instead of the tmux pane —
-# isolates the webrtc publish pipeline from tmux + pyte + text rendering.
-TEST_MODE = os.getenv("TMUX_TEST_MODE", "").lower() in ("1", "true", "yes")
-# Optional: RGB24 → I420 before capture_frame. Default off — publish RGB24 (3 bpp),
-# which matches LiveKit Python guidance for synthetic/camera frames (see python-sdks
-# issues re meet.livekit.io). RGBA→I420 was still producing green garbage for some users.
-USE_I420 = os.getenv("TMUX_USE_I420", "0").lower() in ("1", "true", "yes")
-# Match browsing_agent's browser screenshare (VideoSource default). True enables
-# LiveKit screencast heuristics; try False if you see encoder issues.
-SCREENCAST_SOURCE = os.getenv("TMUX_SCREENCAST", "0").lower() in ("1", "true", "yes")
-# Encode/publish at a standard HD size. Odd sizes (e.g. 1200-wide) can confuse
-# simulcast/SFU layers and produce green/corrupt video; we letterbox the terminal.
-OUT_WIDTH = int(os.getenv("TMUX_OUT_WIDTH", "1280"))
-OUT_HEIGHT = int(os.getenv("TMUX_OUT_HEIGHT", "720"))
-_VIDEO_CODEC_STR = os.getenv("TMUX_VIDEO_CODEC", "h264").strip().lower()
-# "screenshare" | "camera" — use camera if your client mishandles screenshare tracks.
-_TRACK_SRC_STR = os.getenv("TMUX_TRACK_SOURCE", "screenshare").strip().lower()
-# Simple pipeline: RGBA frames + minimal TrackPublishOptions (no forced codec).
-# Defaults match browsing_agent browser_manager screenshare: 640×480, SOURCE_SCREENSHARE.
-COMPAT_VIDEO = os.getenv("TMUX_COMPAT_VIDEO", "1").lower() in ("1", "true", "yes")
-COMPAT_WIDTH = int(os.getenv("TMUX_COMPAT_WIDTH", "1280"))
-COMPAT_HEIGHT = int(os.getenv("TMUX_COMPAT_HEIGHT", "720"))
-# Match browsing_agent/browser_manager exactly: screenshare source, no I420 conversion.
-_COMPAT_TRACK_SRC = os.getenv("TMUX_COMPAT_TRACK_SOURCE", "screenshare").strip().lower()
-# RGBA → I420 before capture_frame. Default OFF — the browsing_agent reference
-# passes RGBA straight through, and the I420 conversion path was producing
-# green/striped output in this setup.
-COMPAT_I420 = os.getenv("TMUX_COMPAT_I420", "0").lower() in ("1", "true", "yes")
-# Write /tmp/tmux_debug_first.rgba on first frame; verify with ffplay before blaming WebRTC.
-DEBUG_RAW_FRAME = os.getenv("TMUX_DEBUG_RAW", "").lower() in ("1", "true", "yes")
-
-def _load_static_share_image(out_w: int, out_h: int) -> Image.Image:
-    """Load TMUX_STATIC_IMAGE (PNG), RGBA, letterboxed to out_w×out_h."""
-    path = Path(TMUX_STATIC_IMAGE).expanduser()
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Static image not found: {path}. Set TMUX_STATIC_IMAGE or add res/static_share.png"
-        )
-    img = Image.open(path).convert("RGBA")
-    return _pad_terminal_image(img, out_w, out_h)
-
-
-def _video_frame_like_video_play(img: Image.Image) -> rtc.VideoFrame:
-    """Build a VideoFrame matching browsing_agent/browser_manager exactly:
-    PIL RGBA → img.tobytes() → rtc.VideoFrame(..., RGBA, ...).
-    """
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-    w, h = img.size
-    rgba_vf = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGBA, img.tobytes())
-    if COMPAT_I420:
-        return rgba_vf.convert(rtc.VideoBufferType.I420)
-    return rgba_vf
-
-
-def _compat_track_source_enum() -> int:
-    if _COMPAT_TRACK_SRC in ("camera", "cam"):
-        return rtc.TrackSource.SOURCE_CAMERA
-    return rtc.TrackSource.SOURCE_SCREENSHARE
-
-
-def _build_publish_options_compat() -> rtc.TrackPublishOptions:
-    """Match browsing_agent/browser_manager: minimal options, only the track source."""
-    return rtc.TrackPublishOptions(source=_compat_track_source_enum())
-
-
-def _video_frame_from_pil_rgba(img: Image.Image) -> rtc.VideoFrame:
-    """PIL RGBA → rtc VideoFrame. Uses RGB24 (not RGBA), per LiveKit Python examples."""
-    w, h = img.size
-    rgb = img.convert("RGB")
-    data = rgb.tobytes()
-    rgb_frame = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGB24, data)
-    if USE_I420:
-        return rgb_frame.convert(rtc.VideoBufferType.I420)
-    return rgb_frame
-
-
-def _pad_terminal_image(img: Image.Image, out_w: int, out_h: int) -> Image.Image:
-    """Letterbox terminal render to a standard output size (default 1280x720)."""
-    if img.size == (out_w, out_h):
-        return img
-    return ImageOps.pad(
-        img,
-        (out_w, out_h),
-        method=Image.Resampling.LANCZOS,
-        color=DEFAULT_BG,
-    )
-
-
-def _video_codec_from_env() -> int:
-    m = {
-        "vp8": rtc.VideoCodec.VP8,
-        "h264": rtc.VideoCodec.H264,
-        "h265": rtc.VideoCodec.H265,
-        "hevc": rtc.VideoCodec.H265,
-        "vp9": rtc.VideoCodec.VP9,
-        "av1": rtc.VideoCodec.AV1,
-    }
-    return m.get(_VIDEO_CODEC_STR, rtc.VideoCodec.H264)
-
-
-def _track_source_from_env() -> int:
-    if _TRACK_SRC_STR in ("camera", "cam"):
-        return rtc.TrackSource.SOURCE_CAMERA
-    return rtc.TrackSource.SOURCE_SCREENSHARE
-
-
-def _build_publish_options() -> rtc.TrackPublishOptions:
-    opts = rtc.TrackPublishOptions()
-    opts.source = _track_source_from_env()
-    opts.video_codec = _video_codec_from_env()
-    ve = rtc.VideoEncoding()
-    ve.max_bitrate = MAX_BITRATE
-    ve.max_framerate = max(FPS, 1)
-    opts.video_encoding.CopyFrom(ve)
-    return opts
 
 
 INSTRUCTIONS = """\
@@ -284,128 +158,27 @@ async def entrypoint(ctx: JobContext) -> None:
     tmux = TmuxHelper(TMUX_SESSION, COLS, ROWS, FONT_SIZE)
     tmux.ensure()
 
-    if COMPAT_VIDEO:
-        vid_w, vid_h = COMPAT_WIDTH, COMPAT_HEIGHT
-        publish_options = _build_publish_options_compat()
-    else:
-        vid_w, vid_h = OUT_WIDTH, OUT_HEIGHT
-        publish_options = _build_publish_options()
+    video = VideoPublisher(tmux.render_frame)
 
-    static_frame: Image.Image | None = None
+    # Diagnostic: override live tmux frames with a static PNG.
     if STREAM_STATIC_PNG:
         try:
-            static_frame = _load_static_share_image(vid_w, vid_h)
-            # PIL (width, height) is the single source of truth for stride = width * 4.
-            vid_w, vid_h = static_frame.size
+            static_img = load_static_png(
+                TMUX_STATIC_IMAGE, video.width, video.height
+            )
+            video.frame_source = lambda: static_img
             logger.info(
-                "streaming static PNG -> %dx%d (from %s)",
-                vid_w,
-                vid_h,
-                Path(TMUX_STATIC_IMAGE).expanduser(),
+                "streaming static PNG %dx%d from %s",
+                video.width, video.height, TMUX_STATIC_IMAGE,
             )
         except OSError as e:
-            logger.error("static PNG mode failed (%s); falling back to tmux video", e)
-            static_frame = None
+            logger.error(
+                "static PNG mode failed (%s); falling back to live tmux video",
+                e,
+            )
 
-    logger.info(
-        "render %dx%d -> publish %dx%d compat_video=%s compat_track=%s compat_i420=%s (cell %dx%d, grid %dx%d) "
-        "codec=%s track_src=%s rgb24_i420=%s screencast_src=%s static_png=%s",
-        tmux.render_width,
-        tmux.render_height,
-        vid_w,
-        vid_h,
-        COMPAT_VIDEO,
-        _COMPAT_TRACK_SRC if COMPAT_VIDEO else "n/a",
-        COMPAT_I420 if COMPAT_VIDEO else False,
-        tmux.cell_size.w,
-        tmux.cell_size.h,
-        COLS,
-        ROWS,
-        _VIDEO_CODEC_STR,
-        _TRACK_SRC_STR,
-        USE_I420,
-        SCREENCAST_SOURCE,
-        static_frame is not None,
-    )
-
-    # video_play.py uses plain VideoSource(w,h) — is_screencast defaults False.
-    source = rtc.VideoSource(
-        vid_w,
-        vid_h,
-        is_screencast=False if COMPAT_VIDEO else SCREENCAST_SOURCE,
-    )
-    track = rtc.LocalVideoTrack.create_video_track("tmux-screen", source)
-    pub = await ctx.room.local_participant.publish_track(track, publish_options)
-    logger.info("published video track sid=%s", pub.sid)
-
-    ow, oh = vid_w, vid_h
-    test_img = Image.new("RGBA", (ow, oh), (0, 0, 0, 255))
-    td = ImageDraw.Draw(test_img)
-    td.rectangle([0, 0, ow // 2, oh // 2], fill=(200, 40, 40, 255))
-    td.rectangle([ow // 2, 0, ow, oh // 2], fill=(40, 160, 40, 255))
-    td.rectangle([0, oh // 2, ow // 2, oh], fill=(40, 60, 200, 255))
-    td.rectangle([ow // 2, oh // 2, ow, oh], fill=(220, 200, 40, 255))
-    big_font = ImageFont.truetype(find_font(), min(120, oh // 4))
-    td.text((ow // 2 - 140, oh // 2 - 70), "TMUX", font=big_font, fill=(255, 255, 255, 255))
-    if TEST_MODE:
-        test_img.save("/tmp/tmux_agent_testcard.png")
-        logger.info("TEST MODE: publishing static test card (%dx%d)", ow, oh)
-
-    # frame_delta_us = 1_000_000 // max(FPS, 1)
-
-    # ONE persistent bytearray + numpy view over it — matches
-    # python-sdks/examples/publish_hue.py. The FFI reads the pixel pointer
-    # asynchronously after capture_frame returns; if we hand it a fresh short-lived
-    # bytes object each iteration, Python GC can invalidate the pointer before the
-    # Rust encoder reads it (→ green/rainbow stripes). A buffer that lives for the
-    # lifetime of the source keeps the pointer stable forever.
-    frame_buffer = bytearray(vid_w * vid_h * 4)
-    frame_view = np.frombuffer(frame_buffer, dtype=np.uint8).reshape(vid_h, vid_w, 4)
-
-    # Follows python-sdks/examples/publish_hue.py: persistent bytearray +
-    # numpy view + rtc.VideoFrame(..., frame_buffer) every iteration so the FFI
-    # pointer stays stable. Pixel content comes from tmux/PIL; the publish
-    # path is otherwise identical to the verified-working hue diagnostic.
-    from time import perf_counter
-
-    async def _stream_video() -> None:
-        logger.info(
-            "stream task start %dx%d FPS=%d buf_len=%d",
-            vid_w, vid_h, max(FPS, 1), len(frame_buffer),
-        )
-        framerate = 1.0 / max(FPS, 1)
-        next_frame_time = perf_counter()
-        frames = 0
-        try:
-            while True:
-                if TEST_MODE:
-                    pub_img = test_img
-                elif static_frame is not None:
-                    pub_img = static_frame
-                else:
-                    pub_img = tmux.render_frame()
-                if pub_img.size != (vid_w, vid_h):
-                    pub_img = _pad_terminal_image(pub_img, vid_w, vid_h)
-                if pub_img.mode != "RGBA":
-                    pub_img = pub_img.convert("RGBA")
-                np.copyto(frame_view, np.asarray(pub_img, dtype=np.uint8))
-                frame = rtc.VideoFrame(
-                    vid_w, vid_h, rtc.VideoBufferType.RGBA, frame_buffer
-                )
-                source.capture_frame(frame)
-                frames += 1
-                if frames <= 5 or frames % 100 == 0:
-                    logger.info("pushed frame %d", frames)
-                next_frame_time += framerate
-                await asyncio.sleep(next_frame_time - perf_counter())
-        except asyncio.CancelledError:
-            logger.info("stream cancelled at frame %d", frames)
-            raise
-        except Exception:
-            logger.exception("stream died at frame %d", frames)
-            raise
-
-    video_task = asyncio.create_task(_stream_video())
+    await video.publish(ctx.room)
+    video.start()
 
     def _tail() -> str:
         return "\n".join(tmux.capture_lines()[-20:])
@@ -535,7 +308,9 @@ async def entrypoint(ctx: JobContext) -> None:
         ],
     )
 
-    session = AgentSession(llm=openai.realtime.RealtimeModel())
+    session = AgentSession(
+        llm=openai.realtime.RealtimeModel()
+    )
 
     async def _watch_claude_prompts() -> None:
         """Poll the pane for Claude Code confirmation prompts and speak up.
@@ -646,7 +421,7 @@ async def entrypoint(ctx: JobContext) -> None:
             completion_task.cancel()
     finally:
         await rtc_proxy.aclose()
-        video_task.cancel()
+        await video.aclose()
 
 
 if __name__ == "__main__":
