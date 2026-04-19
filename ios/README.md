@@ -27,9 +27,11 @@ Key sources:
 - `RoomView.swift` — renders the agent's video track, mic toggle, hangup.
 - `LiveKitVideoView.swift` — `UIViewRepresentable` wrapping `LiveKit.VideoView`.
 - `BrowserView.swift` — `WKWebView` + address bar + reload button.
-- `ProxyClient.swift` — `actor` that ships `HTTPRequest`/`HTTPResponse` over
-  LiveKit byte streams.
-- `TunnelSchemeHandler.swift` — `WKURLSchemeHandler` for the `tunnel://` scheme.
+- `ProxyClient.swift` — `actor` that ships `HTTPRequest`/`HTTPResponse`
+  over LiveKit byte streams (`http.request` / `http.response`).
+- `TunnelSchemeHandler.swift` — `WKURLSchemeHandler` for the `tunnel://`
+  scheme.
+- `SocksProxy.swift` — vestigial; see "Browser tab" below.
 - `OrientationLock.swift` — per-view `UIInterfaceOrientationMask` helper.
 
 ## Xcode setup
@@ -100,32 +102,55 @@ Controls:
 Run on a **physical iPhone**. The iOS Simulator's CoreAudio stack is broken on
 Xcode 16 / macOS 15 (error `-4010`) and cannot publish mic audio.
 
-## Browser tab — HTTP tunnel
+## Browser tab — HTTP tunnel over a custom scheme
 
 The in-app `WKWebView` registers a handler for a custom `tunnel://` scheme.
 Every request the webview issues flows through this chain:
 
 1. `TunnelSchemeHandler` serializes the `URLRequest` into an `HTTPRequest`
    struct (method / path / query / headers / body).
-2. `ProxyClient` opens a LiveKit byte stream with topic `http.request`, writes
-   the serialized request, and awaits a matching `HTTPResponse` on the
-   `http.response` topic (correlated by UUID).
-3. The agent proxies to `PROXY_TARGET` (default `http://localhost:3000`) via
-   `aiohttp` and streams the response back.
+2. `ProxyClient` opens a LiveKit byte stream with topic `http.request`,
+   writes the serialized request, and awaits a matching `HTTPResponse` on
+   `http.response` (correlated by UUID).
+3. The agent proxies to `PROXY_TARGET` (default `http://localhost:3000`)
+   via `aiohttp` and streams the response back.
 
-**Why byte streams, not RPC?** LiveKit RPC caps payloads at ~15 KB — way below a
-typical JS bundle. Byte streams have no effective cap; we've moved 900 KB+ chunks
-through them without issue.
+**Caching.** `WKWebsiteDataStore.nonPersistent()` + every load uses
+`URLRequest(cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)` so
+reloads always re-fetch through the tunnel.
 
-**Why a custom `tunnel://` scheme?** `WKURLSchemeHandler` can only intercept
-custom schemes, not `http`/`https`. The webview loads `tunnel://localhost/` and
-all relative fetches stay inside `tunnel://` where we can intercept them.
-Absolute `http://localhost:3000/…` links in the page would bypass the handler;
-for Claude-built dev sites that rarely matters.
+### Why a custom `tunnel://` scheme (and not a real proxy)
 
-**Caching.** The webview uses `WKWebsiteDataStore.nonPersistent()` and every
-load uses `URLRequest(cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)` so
-reload always re-fetches through the tunnel.
+We'd prefer that the webview just load `http://localhost:3000` directly
+and have traffic transparently routed through LiveKit. Two approaches we
+tried or considered:
+
+- **`WKWebsiteDataStore.proxyConfigurations` (iOS 17+).** The API is
+  public but silently ignored for non-browser apps — it's gated behind
+  Apple's browser-engine entitlement (`com.apple.developer.web-browser-
+  engine.networking`, etc.) which is only granted to EU DMA browser
+  engines. Both `socksv5Proxy` and `httpCONNECTProxy` variants were
+  tested; WKWebView never connected to the local listener.
+- **`NetworkExtension` packet-tunnel provider.** A real per-app VPN.
+  Works, but requires the `com.apple.developer.networking.networkextension`
+  entitlement (Apple-approved), a separate extension target with a ~15
+  MB memory cap, and IPC back to the main app that owns the LiveKit
+  `Room`. Overkill for a personal dev tool.
+
+So the custom scheme is the path that actually works on iOS without
+Apple-side paperwork. `WKURLSchemeHandler` can intercept any scheme
+*except* `http`/`https`, which is why the webview loads
+`tunnel://localhost/...`. Relative URLs stay inside `tunnel://`; the
+agent maps the path onto `PROXY_TARGET` (default `http://localhost:3000`)
+on its own machine.
+
+`SocksProxy.swift` is a vestige of the proxy-configurations attempt and
+is intentionally left as an empty file for Xcode project stability — you
+can remove the reference from the project at your convenience.
+
+**Why byte streams, not RPC.** LiveKit RPC caps payloads at ~15 KB — way
+below a typical JS bundle. Byte streams have no meaningful cap; we've
+moved 900 KB+ chunks through them without issue.
 
 ## Troubleshooting
 
@@ -137,6 +162,9 @@ reload always re-fetches through the tunnel.
 - **Browser tab shows a stale page after you edit the dev server** — hit the
   reload button (circular arrow) next to Go. It forces a re-fetch through the
   tunnel.
+- **Browser tab shows "not connected"** — SOCKS-based proxy config only
+  works on iOS 17+. The minimum deployment target for the project is iOS
+  17.0; if you lower it, the tunnel breaks.
 - **Connect spinner hangs** — check the Agent tab is dispatching. The
   mobile app only joins the room; something has to tell LiveKit to start the
   agent job (Cloud Agents playground, or your own dispatch frontend).

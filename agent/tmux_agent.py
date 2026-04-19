@@ -47,6 +47,11 @@ STREAM_STATIC_PNG = os.getenv("TMUX_STREAM_STATIC_PNG", "0").strip().lower() in 
 # byte stream; we re-issue them against this base URL on the agent's machine
 # and stream the response back. Typical use: Claude runs a dev server on
 # localhost:3000 and the phone views it through the tunnel.
+#
+# We can't use a transparent per-app VPN on iOS because
+# `WKWebsiteDataStore.proxyConfigurations` is silently ignored for
+# non-browser apps (requires Apple's browser-engine entitlement). See
+# `ios/README.md` for details.
 PROXY_TARGET = os.getenv("TMUX_PROXY_TARGET", "http://localhost:3000").rstrip("/")
 PROXY_REQUEST_TOPIC = os.getenv("TMUX_PROXY_REQ_TOPIC", "http.request")
 PROXY_RESPONSE_TOPIC = os.getenv("TMUX_PROXY_RES_TOPIC", "http.response")
@@ -148,7 +153,6 @@ async def _run_http_proxy_request(
     except json.JSONDecodeError:
         headers = {}
 
-    # Drain the request body from the stream.
     body_chunks: list[bytes] = []
     async for chunk in reader:
         body_chunks.append(chunk)
@@ -159,7 +163,6 @@ async def _run_http_proxy_request(
         "proxy %s %s (id=%s, %d bytes in)", method, url, req_id, len(body or b"")
     )
 
-    # Strip hop-by-hop headers that aiohttp manages itself.
     hop = {"host", "connection", "content-length", "transfer-encoding"}
     fwd_headers = {k: v for k, v in headers.items() if k.lower() not in hop}
 
@@ -169,17 +172,13 @@ async def _run_http_proxy_request(
     res_body = b""
     try:
         async with http.request(
-            method,
-            url,
-            headers=fwd_headers,
-            data=body,
+            method, url,
+            headers=fwd_headers, data=body,
             allow_redirects=False,
             timeout=aiohttp.ClientTimeout(total=PROXY_TIMEOUT),
         ) as resp:
             status = resp.status
             status_text = resp.reason or ""
-            # Drop hop-by-hop response headers; the app's URL scheme handler
-            # fabricates Content-Length from the body it receives.
             res_headers = {
                 k: v for k, v in resp.headers.items() if k.lower() not in hop
             }
@@ -202,7 +201,7 @@ async def _run_http_proxy_request(
             f"http.server 3000) and refresh.",
         )
         res_headers = {"Content-Type": "text/html; charset=utf-8"}
-    except Exception as e:  # defensive — keep the handler alive
+    except Exception as e:
         logger.exception("proxy request failed")
         status, status_text = 500, "Internal Server Error"
         res_body = _error_html(
@@ -433,12 +432,10 @@ server = AgentServer()
 async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
 
-    # Register the HTTP-proxy byte-stream handler FIRST, before video setup or
-    # anything else. If the mobile app is already in the room and fires a
-    # request as soon as the agent joins, LiveKit drops the stream with
-    # "ignoring byte stream ... no callback attached" unless the handler is
-    # attached. Shared aiohttp.ClientSession (one per entrypoint) for
-    # connection reuse.
+    # Register the HTTP-proxy byte-stream handler FIRST, before video setup,
+    # so a client that fires a request the instant the agent joins doesn't
+    # get "ignoring byte stream ... no callback attached". One aiohttp
+    # ClientSession is shared across requests for connection reuse.
     http_session = aiohttp.ClientSession()
     proxy_tasks: set[asyncio.Task[None]] = set()
 
@@ -446,13 +443,13 @@ async def entrypoint(ctx: JobContext) -> None:
         reader: rtc.ByteStreamReader, remote_identity: str
     ) -> None:
         task = asyncio.create_task(
-            _run_http_proxy_request(ctx.room, reader, remote_identity, http_session)
+            _run_http_proxy_request(
+                ctx.room, reader, remote_identity, http_session
+            )
         )
         proxy_tasks.add(task)
         task.add_done_callback(proxy_tasks.discard)
 
-    # Dev-mode reload can leave the prior entrypoint's handler attached to the
-    # room; unregister-then-register makes this idempotent.
     try:
         ctx.room.unregister_byte_stream_handler(PROXY_REQUEST_TOPIC)
     except Exception:
@@ -827,7 +824,10 @@ async def entrypoint(ctx: JobContext) -> None:
             prompt_task.cancel()
             completion_task.cancel()
     finally:
-        ctx.room.unregister_byte_stream_handler(PROXY_REQUEST_TOPIC)
+        try:
+            ctx.room.unregister_byte_stream_handler(PROXY_REQUEST_TOPIC)
+        except Exception:
+            pass
         for t in list(proxy_tasks):
             t.cancel()
         await http_session.close()

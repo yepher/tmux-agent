@@ -79,12 +79,18 @@ Two background watchers keep the user in the loop:
 
 ## HTTP tunnel
 
-When the iOS client (see [`../ios/`](../ios/)) opens a `tunnel://` URL, it writes
-a serialized `HTTPRequest` to the `http.request` byte-stream topic. The agent
-forwards it to `PROXY_TARGET` (default `http://localhost:3000`) via `aiohttp` and
-streams the response back on `http.response`. This lets the phone view a dev
-site running on the agent's machine. Errors are returned as styled HTML so the
-WKWebView can render them.
+When the iOS client (see [`../ios/`](../ios/)) opens a `tunnel://` URL, it
+writes a serialized HTTP request to the `http.request` byte-stream topic.
+The agent forwards it to `PROXY_TARGET` (default `http://localhost:3000`)
+via `aiohttp` and streams the response back on `http.response`. Errors
+are returned as styled HTML so the WKWebView shows a readable page.
+
+> We would prefer a transparent per-app VPN so the webview could load
+> `http://localhost:3000` directly, but on iOS 17
+> `WKWebsiteDataStore.proxyConfigurations` is silently ignored for
+> non-browser apps (it requires Apple's browser-engine entitlement). The
+> custom `tunnel://` scheme is the workaround; see `ios/README.md` for
+> details.
 
 ## Configuration (optional env vars)
 
