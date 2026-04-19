@@ -11,20 +11,18 @@ import asyncio
 import json
 import logging
 import os
-import shutil
-import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
 import numpy as np
-import pyte
 from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli
 from livekit.agents.llm import function_tool
 from livekit.plugins import openai
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+from tmux_helper import DEFAULT_BG, TmuxHelper, find_font
 
 load_dotenv()
 
@@ -90,237 +88,6 @@ _COMPAT_TRACK_SRC = os.getenv("TMUX_COMPAT_TRACK_SOURCE", "screenshare").strip()
 COMPAT_I420 = os.getenv("TMUX_COMPAT_I420", "0").lower() in ("1", "true", "yes")
 # Write /tmp/tmux_debug_first.rgba on first frame; verify with ffplay before blaming WebRTC.
 DEBUG_RAW_FRAME = os.getenv("TMUX_DEBUG_RAW", "").lower() in ("1", "true", "yes")
-
-DEFAULT_BG = (20, 20, 24, 255)
-DEFAULT_FG = (220, 220, 220, 255)
-
-FONT_CANDIDATES = [
-    os.getenv("TMUX_FONT_PATH", ""),
-    "/System/Library/Fonts/Menlo.ttc",
-    "/System/Library/Fonts/Monaco.ttf",
-    "/System/Library/Fonts/Courier.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-]
-
-# Xterm-like palette used to resolve pyte's named colors.
-NAMED_COLORS: dict[str, tuple[int, int, int]] = {
-    "black": (0, 0, 0),
-    "red": (205, 0, 0),
-    "green": (0, 205, 0),
-    "yellow": (205, 205, 0),
-    "brown": (205, 205, 0),
-    "blue": (0, 0, 238),
-    "magenta": (205, 0, 205),
-    "cyan": (0, 205, 205),
-    "white": (229, 229, 229),
-    "bright_black": (127, 127, 127),
-    "bright_red": (255, 0, 0),
-    "bright_green": (0, 255, 0),
-    "bright_yellow": (255, 255, 0),
-    "bright_blue": (92, 92, 255),
-    "bright_magenta": (255, 0, 255),
-    "bright_cyan": (0, 255, 255),
-    "bright_white": (255, 255, 255),
-}
-
-
-def _find_font() -> str:
-    for path in FONT_CANDIDATES:
-        if path and os.path.exists(path):
-            return path
-    raise RuntimeError(
-        "No monospace font found. Set TMUX_FONT_PATH to a .ttf/.ttc path."
-    )
-
-
-def _resolve_color(
-    name: str, default: tuple[int, int, int, int], bright: bool = False
-) -> tuple[int, int, int, int]:
-    """Resolve a pyte color token (named, 'default', or 6-char hex) to RGBA."""
-    if name == "default":
-        return default
-    key = f"bright_{name}" if bright and f"bright_{name}" in NAMED_COLORS else name
-    if key in NAMED_COLORS:
-        r, g, b = NAMED_COLORS[key]
-        return (r, g, b, 255)
-    if len(name) == 6:
-        try:
-            return (int(name[0:2], 16), int(name[2:4], 16), int(name[4:6], 16), 255)
-        except ValueError:
-            pass
-    return default
-
-
-@dataclass
-class CellSize:
-    w: int
-    h: int
-
-
-class TmuxSession:
-    def __init__(self, name: str, cols: int, rows: int) -> None:
-        self.name = name
-        self.cols = cols
-        self.rows = rows
-
-    def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["tmux", *args], capture_output=True, text=True, check=check
-        )
-
-    def ensure(self) -> None:
-        if not shutil.which("tmux"):
-            raise RuntimeError("tmux is not installed or not in PATH")
-        exists = self._run("has-session", "-t", self.name, check=False).returncode == 0
-        if not exists:
-            logger.info("creating tmux session %s (%dx%d)", self.name, self.cols, self.rows)
-            self._run(
-                "new-session",
-                "-d",
-                "-s",
-                self.name,
-                "-x",
-                str(self.cols),
-                "-y",
-                str(self.rows),
-            )
-        else:
-            logger.info("attaching to existing tmux session %s", self.name)
-            self._run(
-                "resize-window",
-                "-t",
-                self.name,
-                "-x",
-                str(self.cols),
-                "-y",
-                str(self.rows),
-                check=False,
-            )
-
-    def capture_ansi(self) -> str:
-        """Capture the active pane with SGR escapes preserved."""
-        result = self._run("capture-pane", "-p", "-e", "-t", self.name)
-        return result.stdout
-
-    def capture_plain(self) -> list[str]:
-        result = self._run("capture-pane", "-p", "-t", self.name)
-        lines = result.stdout.splitlines()
-        if len(lines) < self.rows:
-            lines.extend([""] * (self.rows - len(lines)))
-        return [line[: self.cols].ljust(self.cols) for line in lines[: self.rows]]
-
-    def send_literal(self, text: str, enter: bool = False) -> None:
-        self._run("send-keys", "-t", self.name, "-l", text)
-        if enter:
-            self._run("send-keys", "-t", self.name, "Enter")
-
-    def send_keys(self, *keys: str) -> None:
-        self._run("send-keys", "-t", self.name, *keys)
-
-    def list_sessions(self) -> list[str]:
-        r = self._run("list-sessions", "-F", "#{session_name}", check=False)
-        if r.returncode != 0:
-            return []
-        return [line for line in r.stdout.splitlines() if line]
-
-    def list_windows(self) -> list[tuple[int, str, bool]]:
-        r = self._run(
-            "list-windows",
-            "-t",
-            self.name,
-            "-F",
-            "#{window_index}\t#{window_name}\t#{window_active}",
-            check=False,
-        )
-        windows: list[tuple[int, str, bool]] = []
-        for line in r.stdout.splitlines():
-            parts = line.split("\t")
-            if len(parts) == 3:
-                windows.append((int(parts[0]), parts[1], parts[2] == "1"))
-        return windows
-
-    def select_window(self, target: str) -> None:
-        self._run("select-window", "-t", f"{self.name}:{target}")
-
-    def switch_session(self, name: str) -> None:
-        self.name = name
-        self.ensure()
-
-
-def _align(n: int, multiple: int) -> int:
-    return ((n + multiple - 1) // multiple) * multiple
-
-
-class TerminalRenderer:
-    def __init__(self, cols: int, rows: int, font_size: int) -> None:
-        self.cols = cols
-        self.rows = rows
-        self.font = ImageFont.truetype(_find_font(), font_size)
-        char_w = int(round(self.font.getlength("M")))
-        ascent, descent = self.font.getmetrics()
-        char_h = ascent + descent
-        self.cell = CellSize(w=char_w, h=char_h)
-        # webrtc encoders (VP8/VP9/H264) like dims aligned to 16 — avoids
-        # stride/padding artifacts that can show up as color corruption.
-        self.width = _align(cols * char_w, 16)
-        self.height = _align(rows * char_h, 16)
-        self.screen = pyte.Screen(cols, rows)
-        self.stream = pyte.Stream(self.screen)
-
-    def _feed_snapshot(self, ansi_text: str) -> None:
-        self.screen.reset()
-        # Feed each captured row at an absolute cursor position so newlines/wrap
-        # in the source don't throw the emulator off.
-        for y, line in enumerate(ansi_text.splitlines()):
-            if y >= self.rows:
-                break
-            self.stream.feed(f"\x1b[{y + 1};1H")
-            self.stream.feed(line)
-            self.stream.feed("\x1b[0m")  # clear SGR between rows
-
-    def render(self, ansi_text: str) -> Image.Image:
-        self._feed_snapshot(ansi_text)
-        img = Image.new("RGBA", (self.width, self.height), DEFAULT_BG)
-        draw = ImageDraw.Draw(img)
-        for y in range(self.rows):
-            self._draw_row(draw, y, self.screen.buffer[y])
-        return img
-
-    def _draw_row(self, draw: ImageDraw.ImageDraw, y: int, row) -> None:
-        x = 0
-        py = y * self.cell.h
-        while x < self.cols:
-            cell = row[x]
-            end = x + 1
-            while end < self.cols and _attrs_equal(row[end], cell):
-                end += 1
-            fg = _resolve_color(cell.fg, DEFAULT_FG, bright=cell.bold)
-            bg = _resolve_color(cell.bg, DEFAULT_BG)
-            if cell.reverse:
-                fg, bg = bg, fg
-            text = "".join((row[i].data or " ") for i in range(x, end))
-            px = x * self.cell.w
-            width = (end - x) * self.cell.w
-            if bg != DEFAULT_BG:
-                draw.rectangle([px, py, px + width, py + self.cell.h], fill=bg)
-            if text.strip():
-                draw.text((px, py), text, font=self.font, fill=fg)
-                if cell.underscore:
-                    uy = py + self.cell.h - 2
-                    draw.line([(px, uy), (px + width, uy)], fill=fg, width=1)
-            x = end
-
-
-def _attrs_equal(a, b) -> bool:
-    return (
-        a.fg == b.fg
-        and a.bg == b.bg
-        and a.bold == b.bold
-        and a.reverse == b.reverse
-        and a.underscore == b.underscore
-    )
-
 
 def _error_html(status: int, title: str, message: str) -> bytes:
     """Render a minimal mobile-friendly HTML error page for the proxy so that
@@ -468,58 +235,6 @@ async def _run_http_proxy_request(
             await writer.write(res_body)
     finally:
         await writer.aclose()
-
-
-def _is_claude_busy(screen: str) -> bool:
-    """Heuristic: is Claude Code currently processing a request?
-
-    Claude Code shows an "esc to interrupt" cue (and/or a Thinking/Running
-    spinner) while working; the cue disappears once it returns to the idle
-    `>` prompt.
-    """
-    low = screen.lower()
-    return (
-        "esc to interrupt" in low
-        or "thinking…" in low
-        or "thinking..." in low
-        or "running…" in low
-        or "running..." in low
-    )
-
-
-def _detect_claude_prompt(lines: list[str]) -> str | None:
-    """Return the question + options when the pane shows a Claude Code
-    confirmation prompt, else None.
-
-    Shape:
-        Do you want to proceed?
-        ❯ 1. Yes
-          2. Yes, and don't ask again …
-          3. No, tell Claude what to do differently
-    """
-    for i, raw in enumerate(lines):
-        line = raw.strip()
-        if not line:
-            continue
-        low = line.lower()
-        if not (low.startswith("do you want") or low.startswith("would you like")):
-            continue
-        # Scan a small window for the "1. Yes" / "3. No" markers.
-        has_yes = False
-        has_no = False
-        context = [line]
-        for follow in lines[i + 1 : i + 10]:
-            s = follow.strip().lstrip("❯›>•").strip()
-            if not s:
-                continue
-            context.append(s)
-            if s.startswith("1.") and "yes" in s.lower():
-                has_yes = True
-            if s.startswith("3.") and "no" in s.lower():
-                has_no = True
-        if has_yes and has_no:
-            return "\n".join(context[:4])
-    return None
 
 
 def _load_static_share_image(out_w: int, out_h: int) -> Image.Image:
@@ -748,10 +463,8 @@ async def entrypoint(ctx: JobContext) -> None:
         PROXY_REQUEST_TOPIC, PROXY_TARGET,
     )
 
-    tmux = TmuxSession(TMUX_SESSION, COLS, ROWS)
+    tmux = TmuxHelper(TMUX_SESSION, COLS, ROWS, FONT_SIZE)
     tmux.ensure()
-
-    renderer = TerminalRenderer(COLS, ROWS, FONT_SIZE)
 
     if COMPAT_VIDEO:
         vid_w, vid_h = COMPAT_WIDTH, COMPAT_HEIGHT
@@ -779,15 +492,15 @@ async def entrypoint(ctx: JobContext) -> None:
     logger.info(
         "render %dx%d -> publish %dx%d compat_video=%s compat_track=%s compat_i420=%s (cell %dx%d, grid %dx%d) "
         "codec=%s track_src=%s rgb24_i420=%s screencast_src=%s static_png=%s",
-        renderer.width,
-        renderer.height,
+        tmux.render_width,
+        tmux.render_height,
         vid_w,
         vid_h,
         COMPAT_VIDEO,
         _COMPAT_TRACK_SRC if COMPAT_VIDEO else "n/a",
         COMPAT_I420 if COMPAT_VIDEO else False,
-        renderer.cell.w,
-        renderer.cell.h,
+        tmux.cell_size.w,
+        tmux.cell_size.h,
         COLS,
         ROWS,
         _VIDEO_CODEC_STR,
@@ -814,13 +527,13 @@ async def entrypoint(ctx: JobContext) -> None:
     td.rectangle([ow // 2, 0, ow, oh // 2], fill=(40, 160, 40, 255))
     td.rectangle([0, oh // 2, ow // 2, oh], fill=(40, 60, 200, 255))
     td.rectangle([ow // 2, oh // 2, ow, oh], fill=(220, 200, 40, 255))
-    big_font = ImageFont.truetype(_find_font(), min(120, oh // 4))
+    big_font = ImageFont.truetype(find_font(), min(120, oh // 4))
     td.text((ow // 2 - 140, oh // 2 - 70), "TMUX", font=big_font, fill=(255, 255, 255, 255))
     if TEST_MODE:
         test_img.save("/tmp/tmux_agent_testcard.png")
         logger.info("TEST MODE: publishing static test card (%dx%d)", ow, oh)
 
-    frame_delta_us = 1_000_000 // max(FPS, 1)
+    # frame_delta_us = 1_000_000 // max(FPS, 1)
 
     # ONE persistent bytearray + numpy view over it — matches
     # python-sdks/examples/publish_hue.py. The FFI reads the pixel pointer
@@ -852,7 +565,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 elif static_frame is not None:
                     pub_img = static_frame
                 else:
-                    pub_img = renderer.render(tmux.capture_ansi())
+                    pub_img = tmux.render_frame()
                 if pub_img.size != (vid_w, vid_h):
                     pub_img = _pad_terminal_image(pub_img, vid_w, vid_h)
                 if pub_img.mode != "RGBA":
@@ -877,7 +590,7 @@ async def entrypoint(ctx: JobContext) -> None:
     video_task = asyncio.create_task(_stream_video())
 
     def _tail() -> str:
-        return "\n".join(tmux.capture_plain()[-20:])
+        return "\n".join(tmux.capture_lines()[-20:])
 
     @function_tool
     async def run_command(command: str) -> str:
@@ -889,7 +602,7 @@ async def entrypoint(ctx: JobContext) -> None:
             command: The full shell command to run.
         """
         logger.info("run_command: %s", command)
-        tmux.send_literal(command, enter=True)
+        tmux.send_text(command, press_enter=True)
         await asyncio.sleep(0.4)
         return _tail()
 
@@ -904,7 +617,7 @@ async def entrypoint(ctx: JobContext) -> None:
             press_enter: If true, press Enter after typing.
         """
         logger.info("send_text: %r (enter=%s)", text, press_enter)
-        tmux.send_literal(text, enter=press_enter)
+        tmux.send_text(text, press_enter=press_enter)
         await asyncio.sleep(0.25)
         return _tail()
 
@@ -919,14 +632,14 @@ async def entrypoint(ctx: JobContext) -> None:
             key: A tmux-style key name.
         """
         logger.info("send_key: %s", key)
-        tmux.send_keys(key)
+        tmux.send_key(key)
         await asyncio.sleep(0.25)
         return _tail()
 
     @function_tool
     async def read_screen() -> str:
         """Return the current visible contents of the tmux pane (plain text)."""
-        return "\n".join(tmux.capture_plain())
+        return tmux.capture_text()
 
     @function_tool
     async def wait_for_output(seconds: float = 2.0) -> str:
@@ -944,7 +657,7 @@ async def entrypoint(ctx: JobContext) -> None:
         s = max(0.5, min(seconds, 10.0))
         logger.info("wait_for_output: sleeping %.2fs", s)
         await asyncio.sleep(s)
-        return "\n".join(tmux.capture_plain())
+        return tmux.capture_text()
 
     @function_tool
     async def list_sessions() -> str:
@@ -952,7 +665,8 @@ async def entrypoint(ctx: JobContext) -> None:
         sessions = tmux.list_sessions()
         if not sessions:
             return "No tmux sessions found."
-        return "\n".join(f"{'*' if s == tmux.name else ' '} {s}" for s in sessions)
+        current = tmux.session_name
+        return "\n".join(f"{'*' if s == current else ' '} {s}" for s in sessions)
 
     @function_tool
     async def switch_session(name: str) -> str:
@@ -1018,8 +732,8 @@ async def entrypoint(ctx: JobContext) -> None:
         while True:
             await asyncio.sleep(0.8)
             try:
-                lines = tmux.capture_plain()
-                prompt = _detect_claude_prompt(lines)
+                lines = tmux.capture_lines()
+                prompt = TmuxHelper.detect_claude_prompt(lines)
                 if prompt and prompt != last_seen:
                     last_seen = prompt
                     logger.info("claude-code prompt detected: %s", prompt)
@@ -1055,9 +769,9 @@ async def entrypoint(ctx: JobContext) -> None:
         while True:
             await asyncio.sleep(1.0)
             try:
-                screen = "\n".join(tmux.capture_plain())
+                screen = tmux.capture_text()
                 now = loop.time()
-                if _is_claude_busy(screen):
+                if TmuxHelper.is_claude_busy(screen):
                     if busy_since is None:
                         busy_since = now
                 elif busy_since is not None:
@@ -1083,6 +797,18 @@ async def entrypoint(ctx: JobContext) -> None:
             except Exception:
                 logger.exception("completion watcher error")
 
+    # End the job when the last remote participant leaves. Without this, the
+    # entrypoint would block on `asyncio.Event().wait()` forever and keep
+    # pushing video frames into an empty room.
+    exit_event = asyncio.Event()
+
+    def _on_participant_disconnected(_: rtc.RemoteParticipant) -> None:
+        if len(ctx.room.remote_participants) == 0:
+            logger.info("last participant left — ending job")
+            exit_event.set()
+
+    ctx.room.on("participant_disconnected", _on_participant_disconnected)
+
     try:
         # record={"audio": False}: skip audio encoding (Opus is marked experimental in
         # the bundled ffmpeg and breaks recorder_io); keep traces/logs/transcripts.
@@ -1094,7 +820,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # livekit_info/examples/browsing_agent/main.py pattern) or the framework
         # cancels any tasks we created — including the video publisher.
         try:
-            await asyncio.Event().wait()
+            await exit_event.wait()
         except asyncio.CancelledError:
             pass
         finally:
