@@ -8,12 +8,10 @@ tmux via `capture-pane -e`.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from pathlib import Path
 
-import aiohttp
 import numpy as np
 from dotenv import load_dotenv
 from livekit import rtc
@@ -22,6 +20,7 @@ from livekit.agents.llm import function_tool
 from livekit.plugins import openai
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+from rtc_proxy import RtcProxy
 from tmux_helper import DEFAULT_BG, TmuxHelper, find_font
 
 load_dotenv()
@@ -42,20 +41,6 @@ STREAM_STATIC_PNG = os.getenv("TMUX_STREAM_STATIC_PNG", "0").strip().lower() in 
     "true",
     "yes",
 )
-
-# HTTP proxy: the iOS app tunnels WKWebView requests to us over a LiveKit
-# byte stream; we re-issue them against this base URL on the agent's machine
-# and stream the response back. Typical use: Claude runs a dev server on
-# localhost:3000 and the phone views it through the tunnel.
-#
-# We can't use a transparent per-app VPN on iOS because
-# `WKWebsiteDataStore.proxyConfigurations` is silently ignored for
-# non-browser apps (requires Apple's browser-engine entitlement). See
-# `ios/README.md` for details.
-PROXY_TARGET = os.getenv("TMUX_PROXY_TARGET", "http://localhost:3000").rstrip("/")
-PROXY_REQUEST_TOPIC = os.getenv("TMUX_PROXY_REQ_TOPIC", "http.request")
-PROXY_RESPONSE_TOPIC = os.getenv("TMUX_PROXY_RES_TOPIC", "http.response")
-PROXY_TIMEOUT = float(os.getenv("TMUX_PROXY_TIMEOUT", "30"))
 
 TMUX_SESSION = os.getenv("TMUX_SESSION_NAME", "agent")
 COLS = int(os.getenv("TMUX_COLS", "100"))
@@ -93,148 +78,6 @@ _COMPAT_TRACK_SRC = os.getenv("TMUX_COMPAT_TRACK_SOURCE", "screenshare").strip()
 COMPAT_I420 = os.getenv("TMUX_COMPAT_I420", "0").lower() in ("1", "true", "yes")
 # Write /tmp/tmux_debug_first.rgba on first frame; verify with ffplay before blaming WebRTC.
 DEBUG_RAW_FRAME = os.getenv("TMUX_DEBUG_RAW", "").lower() in ("1", "true", "yes")
-
-def _error_html(status: int, title: str, message: str) -> bytes:
-    """Render a minimal mobile-friendly HTML error page for the proxy so that
-    WKWebView actually shows a readable error instead of blank/old content."""
-    import html as _html
-    safe_title = _html.escape(title)
-    safe_msg = _html.escape(message).replace("\n", "<br>")
-    body = (
-        f"<!doctype html><html><head><meta charset='utf-8'>"
-        f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"<title>{status} {safe_title}</title>"
-        f"<style>"
-        f"body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;"
-        f"background:#1b1b1f;color:#eee;margin:0;padding:2em;"
-        f"line-height:1.5;-webkit-text-size-adjust:none}}"
-        f".card{{max-width:600px;margin:0 auto;"
-        f"background:#2a2a30;border-radius:12px;padding:1.5em;"
-        f"border:1px solid #5c2222}}"
-        f".badge{{display:inline-block;padding:0.2em 0.6em;"
-        f"border-radius:6px;background:#b0413e;color:#fff;"
-        f"font-size:0.9em;font-weight:600;margin-bottom:0.8em}}"
-        f".title{{font-size:1.3em;margin:0 0 0.8em}}"
-        f".msg{{color:#ccc;white-space:pre-wrap;"
-        f"font-family:ui-monospace,Menlo,monospace;font-size:0.95em}}"
-        f".foot{{margin-top:1.2em;color:#888;font-size:0.82em}}"
-        f"</style></head><body><div class='card'>"
-        f"<span class='badge'>{status}</span>"
-        f"<h1 class='title'>{safe_title}</h1>"
-        f"<div class='msg'>{safe_msg}</div>"
-        f"<div class='foot'>tmux-agent proxy → {PROXY_TARGET}</div>"
-        f"</div></body></html>"
-    )
-    return body.encode("utf-8")
-
-
-async def _run_http_proxy_request(
-    room: rtc.Room,
-    reader: rtc.ByteStreamReader,
-    remote_identity: str,
-    http: aiohttp.ClientSession,
-) -> None:
-    """Handle a single proxied HTTP request from the mobile app.
-
-    Wire format (see ios/README.md):
-      Request stream attributes:
-        id, method, path, headers (json dict string)
-        Stream body: request body bytes (possibly empty).
-      Response stream attributes:
-        id, status, status_text, headers (json dict string)
-        Stream body: response body bytes.
-    """
-    attrs = dict(reader.info.attributes or {})
-    req_id = attrs.get("id", reader.info.stream_id)
-    method = attrs.get("method", "GET").upper()
-    path = attrs.get("path", "/")
-    try:
-        headers = json.loads(attrs.get("headers", "{}") or "{}")
-    except json.JSONDecodeError:
-        headers = {}
-
-    body_chunks: list[bytes] = []
-    async for chunk in reader:
-        body_chunks.append(chunk)
-    body = b"".join(body_chunks) if body_chunks else None
-
-    url = f"{PROXY_TARGET}{path if path.startswith('/') else '/' + path}"
-    logger.info(
-        "proxy %s %s (id=%s, %d bytes in)", method, url, req_id, len(body or b"")
-    )
-
-    hop = {"host", "connection", "content-length", "transfer-encoding"}
-    fwd_headers = {k: v for k, v in headers.items() if k.lower() not in hop}
-
-    status = 502
-    status_text = "Bad Gateway"
-    res_headers: dict[str, str] = {}
-    res_body = b""
-    try:
-        async with http.request(
-            method, url,
-            headers=fwd_headers, data=body,
-            allow_redirects=False,
-            timeout=aiohttp.ClientTimeout(total=PROXY_TIMEOUT),
-        ) as resp:
-            status = resp.status
-            status_text = resp.reason or ""
-            res_headers = {
-                k: v for k, v in resp.headers.items() if k.lower() not in hop
-            }
-            res_body = await resp.read()
-    except asyncio.TimeoutError:
-        status, status_text = 504, "Gateway Timeout"
-        res_body = _error_html(
-            status, "Gateway Timeout",
-            f"The agent's upstream at {PROXY_TARGET} didn't respond within "
-            f"{PROXY_TIMEOUT:.0f}s.\n\nCheck that your dev server (e.g. "
-            f"npm run dev) is still running.",
-        )
-        res_headers = {"Content-Type": "text/html; charset=utf-8"}
-    except aiohttp.ClientError as e:
-        status, status_text = 502, "Bad Gateway"
-        res_body = _error_html(
-            status, "Bad Gateway",
-            f"The agent could not reach {PROXY_TARGET}.\n\n{e}\n\n"
-            f"Start something on that port (e.g. npm run dev, python -m "
-            f"http.server 3000) and refresh.",
-        )
-        res_headers = {"Content-Type": "text/html; charset=utf-8"}
-    except Exception as e:
-        logger.exception("proxy request failed")
-        status, status_text = 500, "Internal Server Error"
-        res_body = _error_html(
-            status, "Proxy Error", f"Unexpected error in the agent proxy: {e}"
-        )
-        res_headers = {"Content-Type": "text/html; charset=utf-8"}
-
-    logger.info(
-        "proxy %s %s -> %d (id=%s, %d bytes out)",
-        method, url, status, req_id, len(res_body),
-    )
-
-    writer = await room.local_participant.stream_bytes(
-        name=f"response-{req_id}",
-        topic=PROXY_RESPONSE_TOPIC,
-        destination_identities=[remote_identity],
-        attributes={
-            "id": req_id,
-            "status": str(status),
-            "status_text": status_text,
-            "headers": json.dumps(res_headers),
-        },
-        total_size=len(res_body),
-        mime_type=res_headers.get(
-            "Content-Type", "application/octet-stream"
-        ).split(";")[0].strip(),
-    )
-    try:
-        if res_body:
-            await writer.write(res_body)
-    finally:
-        await writer.aclose()
-
 
 def _load_static_share_image(out_w: int, out_h: int) -> Image.Image:
     """Load TMUX_STATIC_IMAGE (PNG), RGBA, letterboxed to out_w×out_h."""
@@ -434,31 +277,9 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # Register the HTTP-proxy byte-stream handler FIRST, before video setup,
     # so a client that fires a request the instant the agent joins doesn't
-    # get "ignoring byte stream ... no callback attached". One aiohttp
-    # ClientSession is shared across requests for connection reuse.
-    http_session = aiohttp.ClientSession()
-    proxy_tasks: set[asyncio.Task[None]] = set()
-
-    def _on_proxy_request(
-        reader: rtc.ByteStreamReader, remote_identity: str
-    ) -> None:
-        task = asyncio.create_task(
-            _run_http_proxy_request(
-                ctx.room, reader, remote_identity, http_session
-            )
-        )
-        proxy_tasks.add(task)
-        task.add_done_callback(proxy_tasks.discard)
-
-    try:
-        ctx.room.unregister_byte_stream_handler(PROXY_REQUEST_TOPIC)
-    except Exception:
-        pass
-    ctx.room.register_byte_stream_handler(PROXY_REQUEST_TOPIC, _on_proxy_request)
-    logger.info(
-        "http proxy ready: topic=%s target=%s",
-        PROXY_REQUEST_TOPIC, PROXY_TARGET,
-    )
+    # get "ignoring byte stream ... no callback attached".
+    rtc_proxy = RtcProxy()
+    await rtc_proxy.attach(ctx.room)
 
     tmux = TmuxHelper(TMUX_SESSION, COLS, ROWS, FONT_SIZE)
     tmux.ensure()
@@ -824,13 +645,7 @@ async def entrypoint(ctx: JobContext) -> None:
             prompt_task.cancel()
             completion_task.cancel()
     finally:
-        try:
-            ctx.room.unregister_byte_stream_handler(PROXY_REQUEST_TOPIC)
-        except Exception:
-            pass
-        for t in list(proxy_tasks):
-            t.cancel()
-        await http_session.close()
+        await rtc_proxy.aclose()
         video_task.cancel()
 
 
