@@ -17,6 +17,7 @@ from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli
 from livekit.agents.llm import function_tool
 from livekit.plugins import openai
 
+from rtc_control import RtcControl
 from rtc_proxy import RtcProxy
 from tmux_helper import TmuxHelper
 from video_publisher import VideoPublisher, load_static_png
@@ -157,6 +158,9 @@ async def entrypoint(ctx: JobContext) -> None:
 
     tmux = TmuxHelper(TMUX_SESSION, COLS, ROWS, FONT_SIZE)
     tmux.ensure()
+
+    control = RtcControl(tmux)
+    await control.attach(ctx.room)
 
     video = VideoPublisher(tmux.render_frame)
 
@@ -420,6 +424,7 @@ async def entrypoint(ctx: JobContext) -> None:
             prompt_task.cancel()
             completion_task.cancel()
     finally:
+        await control.aclose()
         await rtc_proxy.aclose()
         await video.aclose()
 
