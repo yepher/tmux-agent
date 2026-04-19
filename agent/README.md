@@ -73,6 +73,7 @@ Two background watchers keep the user in the loop:
 | `send_text(text, press_enter=False)` | Types literal characters; Enter is opt-in. Use for interactive prompts / Claude Code. |
 | `send_key(key)` | Sends a tmux-style key name: `Enter`, `Tab`, `Escape`, `Up`, `C-c`, `C-l`, `S-Tab`, `M-p`, … |
 | `read_screen()` | Returns the visible pane text. The agent calls this to decide what to do. |
+| `read_scrollback(lines=200)` | Returns the visible pane plus `lines` rows of tmux scrollback (clamped to 50–2000). Used when the user asks about earlier output that's already scrolled off. |
 | `wait_for_output(seconds=2.0)` | Sleep (clamped to 0.5–10s), then return the visible pane. Use after launching slow starters (`claude`, `vim`, `npm install`, `ssh`, …) before concluding a command failed. |
 | `list_sessions()` / `switch_session(name)` | Enumerate / switch tmux sessions; creates one if missing. |
 | `list_windows()` / `switch_window(target)` | Enumerate / select windows by index or name in the current session. |

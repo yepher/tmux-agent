@@ -144,6 +144,19 @@ class _TmuxSession:
             lines.extend([""] * (self.rows - len(lines)))
         return [line[: self.cols].ljust(self.cols) for line in lines[: self.rows]]
 
+    def capture_scrollback(self, lines: int) -> str:
+        """Capture the pane plus `lines` rows of scrollback as plain text.
+
+        Uses `tmux capture-pane -S -<n>` which indexes into the scrollback
+        buffer (negative = rows above the visible top). Returns the
+        scrollback rows followed by the currently-visible pane, in
+        top-to-bottom order.
+        """
+        result = self._run(
+            "capture-pane", "-p", "-S", f"-{lines}", "-t", self.name,
+        )
+        return result.stdout
+
     def send_literal(self, text: str, enter: bool = False) -> None:
         self._run("send-keys", "-t", self.name, "-l", text)
         if enter:
@@ -298,6 +311,15 @@ class TmuxHelper:
     def capture_text(self) -> str:
         """`capture_lines()` joined with newlines."""
         return "\n".join(self._session.capture_plain())
+
+    def capture_scrollback(self, lines: int) -> str:
+        """Plain-text pane plus `lines` rows of scrollback history.
+
+        Unlike `capture_text()` (visible pane only), this reaches back into
+        the tmux scrollback buffer so the agent can answer questions about
+        output that has already scrolled off-screen.
+        """
+        return self._session.capture_scrollback(lines)
 
     # --- input ------------------------------------------------------------
 
