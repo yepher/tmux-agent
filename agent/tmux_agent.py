@@ -395,6 +395,33 @@ async def entrypoint(ctx: JobContext) -> None:
         llm=openai.realtime.RealtimeModel()
     )
 
+    # When the iOS session dropdown switches sessions, the RPC handler
+    # flips TmuxHelper's active session without telling the voice agent.
+    # Nudge the LLM to (a) re-check the pane and (b) DROP any pending
+    # action from the prior session — otherwise it happily types the
+    # previous user request into a shell that doesn't understand it.
+    def _on_session_change(new_name: str) -> None:
+        logger.info("agent nudge: session switched to %s", new_name)
+        session.generate_reply(
+            instructions=(
+                f"The user just switched to the tmux session '{new_name}' "
+                "via the mobile UI. CRITICAL: any request the user made "
+                "BEFORE this switch is now stale and must be DROPPED. Do "
+                "NOT type, send, or execute anything related to the prior "
+                "context — the new session is a different environment with "
+                "possibly different programs running. "
+                "Call `read_screen` now to see what's actually on this "
+                "session. Detect whether it's a shell prompt or Claude "
+                "Code. Then say ONE short sentence describing what's on "
+                "screen — e.g. 'You're at a shell prompt in that session' "
+                "or 'Claude Code is running there'. Do NOT ask a follow-up "
+                "and do NOT run any tools other than `read_screen`. Wait "
+                "for the user to direct the next action."
+            )
+        )
+
+    control.on_session_change = _on_session_change
+
     async def _watch_claude_prompts() -> None:
         """Poll the pane for Claude Code confirmation prompts and speak up.
 

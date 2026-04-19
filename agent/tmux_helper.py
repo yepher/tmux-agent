@@ -134,11 +134,27 @@ class _TmuxSession:
             )
 
     def capture_ansi(self) -> str:
-        """Capture the active pane with SGR escapes preserved."""
-        return self._run("capture-pane", "-p", "-e", "-t", self.name).stdout
+        """Capture the active pane with SGR escapes preserved.
+
+        Returns "" if the session is gone (e.g. the user typed `exit` in
+        its last pane). That lets the video loop keep running with a blank
+        frame instead of crashing.
+        """
+        result = self._run(
+            "capture-pane", "-p", "-e", "-t", self.name, check=False,
+        )
+        if result.returncode != 0:
+            self._log_capture_failure("capture_ansi", result)
+            return ""
+        return result.stdout
 
     def capture_plain(self) -> list[str]:
-        result = self._run("capture-pane", "-p", "-t", self.name)
+        result = self._run(
+            "capture-pane", "-p", "-t", self.name, check=False,
+        )
+        if result.returncode != 0:
+            self._log_capture_failure("capture_plain", result)
+            return [" " * self.cols] * self.rows
         lines = result.stdout.splitlines()
         if len(lines) < self.rows:
             lines.extend([""] * (self.rows - len(lines)))
@@ -154,8 +170,23 @@ class _TmuxSession:
         """
         result = self._run(
             "capture-pane", "-p", "-S", f"-{lines}", "-t", self.name,
+            check=False,
         )
+        if result.returncode != 0:
+            self._log_capture_failure("capture_scrollback", result)
+            return ""
         return result.stdout
+
+    # Throttle "session gone" logs — they fire per frame otherwise.
+    _last_failure_msg: str = ""
+
+    def _log_capture_failure(
+        self, op: str, result: subprocess.CompletedProcess
+    ) -> None:
+        msg = f"{op} failed on '{self.name}': {(result.stderr or '').strip()}"
+        if msg != self._last_failure_msg:
+            logger.warning("%s", msg)
+            self._last_failure_msg = msg
 
     def send_literal(self, text: str, enter: bool = False) -> None:
         self._run("send-keys", "-t", self.name, "-l", text)

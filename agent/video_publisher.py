@@ -200,14 +200,29 @@ class VideoPublisher:
         dt = 1.0 / self._fps
         next_t = perf_counter()
         frames = 0
+        last_frame_error: str = ""
         try:
             while True:
-                img = self.frame_source()
-                if img.size != (self.width, self.height):
-                    img = _pad(img, self.width, self.height)
-                if img.mode != "RGBA":
-                    img = img.convert("RGBA")
-                np.copyto(self._view, np.asarray(img, dtype=np.uint8))
+                try:
+                    img = self.frame_source()
+                    if img.size != (self.width, self.height):
+                        img = _pad(img, self.width, self.height)
+                    if img.mode != "RGBA":
+                        img = img.convert("RGBA")
+                    np.copyto(self._view, np.asarray(img, dtype=np.uint8))
+                except Exception as e:
+                    # Don't kill the stream on transient frame-source errors
+                    # (e.g. user typed `exit` and the tmux session died).
+                    # Reuse the previous buffer contents so the last frame
+                    # stays visible until the source recovers.
+                    msg = repr(e)
+                    if msg != last_frame_error:
+                        logger.warning(
+                            "frame source error at frame %d: %s", frames, msg
+                        )
+                        last_frame_error = msg
+                else:
+                    last_frame_error = ""
                 self._source.capture_frame(rtc.VideoFrame(
                     self.width, self.height,
                     rtc.VideoBufferType.RGBA, self._buffer,

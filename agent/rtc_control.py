@@ -15,8 +15,12 @@ or creates one if it doesn't exist — same semantics as the voice tool.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
+from collections.abc import Awaitable, Callable
+from typing import Union
 
 from livekit import rtc
 
@@ -27,6 +31,13 @@ logger = logging.getLogger("tmux-agent")
 METHOD_LIST = "sessions.list"
 METHOD_SWITCH = "sessions.switch"
 
+# Callback fired when a session switch happens via RPC. Sync or async.
+OnSessionChange = Union[
+    Callable[[str], None],
+    Callable[[str], Awaitable[None]],
+    None,
+]
+
 
 class RtcControl:
     """Owns the lifecycle of the session-control RPC handlers.
@@ -34,6 +45,9 @@ class RtcControl:
     Usage:
         control = RtcControl(tmux)
         await control.attach(ctx.room)
+        # Optional: get notified when the UI switches sessions, so the voice
+        # agent can re-check the pane and tell the user what's there.
+        control.on_session_change = some_callback
         try:
             ...
         finally:
@@ -43,6 +57,7 @@ class RtcControl:
     def __init__(self, tmux: TmuxHelper) -> None:
         self._tmux = tmux
         self._room: rtc.Room | None = None
+        self.on_session_change: OnSessionChange = None
 
     async def attach(self, room: rtc.Room) -> None:
         """Register RPC handlers on the room's local participant."""
@@ -96,7 +111,27 @@ class RtcControl:
         try:
             self._tmux.switch_session(name)
             logger.info("rpc sessions.switch: now on %s", name)
-            return json.dumps({"ok": True, "current": name})
         except Exception as e:
             logger.exception("rpc sessions.switch failed")
             return json.dumps({"ok": False, "error": str(e)})
+
+        # Notify any listener (e.g. the voice agent) that the current session
+        # has changed. Swallow errors so a misbehaving callback can't break
+        # the RPC contract.
+        cb = self.on_session_change
+        if cb is not None:
+            try:
+                result = cb(name)
+                if inspect.isawaitable(result):
+                    asyncio.create_task(_suppress(result))
+            except Exception:
+                logger.exception("session-change callback failed")
+
+        return json.dumps({"ok": True, "current": name})
+
+
+async def _suppress(awaitable: Awaitable[None]) -> None:
+    try:
+        await awaitable
+    except Exception:
+        logger.exception("async session-change callback failed")
