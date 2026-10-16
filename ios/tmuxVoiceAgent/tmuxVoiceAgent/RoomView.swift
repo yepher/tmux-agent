@@ -9,14 +9,18 @@ struct RoomView: View {
     @State private var showNewSessionAlert = false
     @State private var newSessionName = ""
 
+    /// iPhone reports a compact vertical size class in landscape.
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    private var isLandscape: Bool { verticalSizeClass == .compact }
+
     var body: some View {
         NavigationStack {
             ZStack {
                 Color.black.ignoresSafeArea()
 
                 if let track = connection.screenShareTrack {
-                    // Keep the phone portrait but display the tmux terminal
-                    // landscape-oriented.
+                    // Portrait: show the landscape terminal sideways so it
+                    // fills the screen (turn your head, or the phone).
                     //   1. First frame (h × w) gives the video a landscape-
                     //      shaped canvas as if the phone were rotated.
                     //   2. rotationEffect rotates the whole thing -90° so
@@ -24,18 +28,26 @@ struct RoomView: View {
                     //   3. Second frame (w × h) reports the final visual
                     //      size back to SwiftUI layout so it fills the
                     //      portrait screen.
-                    // LiveKit's VideoView internally does aspect-fit, so the
-                    // 4:3 video letterboxes within that landscape canvas and
-                    // ends up as large as possible.
+                    // Landscape: iOS has already rotated the UI, so the
+                    // extra -90° would turn the text upside down. Show the
+                    // video upright, edge to edge (nav/tab bars hidden,
+                    // safe areas ignored), aspect-fit so nothing is cropped.
                     GeometryReader { geo in
-                        LiveKitVideoView(track: track, layoutMode: .fill)
-                            .frame(width: geo.size.height,
-                                   height: geo.size.width)
-                            .rotationEffect(.degrees(-90))
-                            .frame(width: geo.size.width,
-                                   height: geo.size.height)
-                            .clipped()
+                        if isLandscape {
+                            LiveKitVideoView(track: track, layoutMode: .fit)
+                                .frame(width: geo.size.width,
+                                       height: geo.size.height)
+                        } else {
+                            LiveKitVideoView(track: track, layoutMode: .fill)
+                                .frame(width: geo.size.height,
+                                       height: geo.size.width)
+                                .rotationEffect(.degrees(-90))
+                                .frame(width: geo.size.width,
+                                       height: geo.size.height)
+                                .clipped()
+                        }
                     }
+                    .ignoresSafeArea(edges: isLandscape ? .all : [])
                 } else {
                     placeholder
                 }
@@ -67,6 +79,11 @@ struct RoomView: View {
             }
             .navigationTitle("Agent")
             .navigationBarTitleDisplayMode(.inline)
+            // Landscape is for reading the terminal: give the video the
+            // whole screen. Rotate back to portrait for sessions / hang up.
+            .toolbar(isLandscape ? .hidden : .visible, for: .navigationBar)
+            .toolbar(isLandscape ? .hidden : .visible, for: .tabBar)
+            .statusBarHidden(isLandscape)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     if connection.state == .connected {
