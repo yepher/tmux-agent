@@ -5,15 +5,20 @@ to an RGBA image.
   * a `_TmuxSession` — thin wrapper around `tmux(1)` subprocess calls.
   * a `_TerminalRenderer` — `pyte` virtual terminal + PIL glyph drawer.
   * static helpers that inspect the pane contents for Claude Code state.
+
+All methods are synchronous (they shell out to `tmux`). Call them from a
+worker thread (`asyncio.to_thread`) when running inside the event loop.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 
 import pyte
 from PIL import Image, ImageDraw, ImageFont
@@ -22,6 +27,10 @@ logger = logging.getLogger("tmux-agent")
 
 DEFAULT_BG: tuple[int, int, int, int] = (20, 20, 24, 255)
 DEFAULT_FG: tuple[int, int, int, int] = (220, 220, 220, 255)
+
+# Pin the tmux window to COLS x ROWS so a laptop client attaching to the same
+# session can't resize it out from under the renderer.
+LOCK_SIZE = os.getenv("TMUX_LOCK_SIZE", "1").strip().lower() in ("1", "true", "yes")
 
 _FONT_CANDIDATES = [
     os.getenv("TMUX_FONT_PATH", ""),
@@ -32,26 +41,36 @@ _FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
 ]
 
-# Xterm-like palette used to resolve pyte's named colors.
+# Xterm-like palette keyed by pyte's color names. pyte names the ANSI
+# 33/43 color "brown" and the aixterm 90-97/100-107 colors "bright<name>"
+# (no underscore).
 _NAMED_COLORS: dict[str, tuple[int, int, int]] = {
     "black": (0, 0, 0),
     "red": (205, 0, 0),
     "green": (0, 205, 0),
-    "yellow": (205, 205, 0),
     "brown": (205, 205, 0),
+    "yellow": (205, 205, 0),
     "blue": (0, 0, 238),
     "magenta": (205, 0, 205),
     "cyan": (0, 205, 205),
     "white": (229, 229, 229),
-    "bright_black": (127, 127, 127),
-    "bright_red": (255, 0, 0),
-    "bright_green": (0, 255, 0),
-    "bright_yellow": (255, 255, 0),
-    "bright_blue": (92, 92, 255),
-    "bright_magenta": (255, 0, 255),
-    "bright_cyan": (0, 255, 255),
-    "bright_white": (255, 255, 255),
+    "brightblack": (127, 127, 127),
+    "brightred": (255, 0, 0),
+    "brightgreen": (0, 255, 0),
+    "brightbrown": (255, 255, 0),
+    "brightyellow": (255, 255, 0),
+    "brightblue": (92, 92, 255),
+    "brightmagenta": (255, 0, 255),
+    "brightcyan": (0, 255, 255),
+    "brightwhite": (255, 255, 255),
 }
+
+# tmux rewrites ':' and '.' in session names, and they are target separators.
+_INVALID_SESSION_CHARS = re.compile(r"[:.\s]")
+
+# "❯ 1. Yes" / "  2. No, tell Claude…" inside Claude Code's prompt box.
+_OPTION_RE = re.compile(r"^(?:[❯›>•*]\s*)?(\d+)[.)]\s+(.+)$")
+_BOX_CHARS = "│┃|╭╮╰╯─ "
 
 
 def find_font() -> str:
@@ -70,7 +89,9 @@ def _resolve_color(
     """Resolve a pyte color token (named, 'default', or 6-char hex) to RGBA."""
     if name == "default":
         return default
-    key = f"bright_{name}" if bright and f"bright_{name}" in _NAMED_COLORS else name
+    key = name
+    if bright and not name.startswith("bright") and f"bright{name}" in _NAMED_COLORS:
+        key = f"bright{name}"
     if key in _NAMED_COLORS:
         r, g, b = _NAMED_COLORS[key]
         return (r, g, b, 255)
@@ -96,42 +117,103 @@ def _align(n: int, multiple: int) -> int:
     return ((n + multiple - 1) // multiple) * multiple
 
 
+def validate_session_name(name: str) -> str:
+    """Return a cleaned session name or raise ValueError."""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("session name is empty")
+    if _INVALID_SESSION_CHARS.search(name):
+        raise ValueError(
+            f"invalid session name {name!r}: no spaces, ':' or '.' allowed"
+        )
+    return name
+
+
 @dataclass
 class CellSize:
     w: int
     h: int
 
 
+@dataclass
+class ClaudePrompt:
+    """A Claude Code multiple-choice prompt detected on screen."""
+
+    question: str
+    options: list[tuple[int, str]] = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        return self.question + "|" + "|".join(f"{n}.{t}" for n, t in self.options)
+
+    def option_for(self, *prefixes: str) -> int | None:
+        """Number of the first option whose label starts with any prefix."""
+        for num, label in self.options:
+            low = label.lower()
+            if any(low.startswith(p) for p in prefixes):
+                return num
+        return None
+
+
 class _TmuxSession:
-    """Thin wrapper around `tmux` CLI for one named session."""
+    """Thin wrapper around `tmux` CLI for one named session.
+
+    Targets use tmux's `=` prefix so names match exactly (plain `-t foo`
+    prefix-matches, so `-t a` would hit a session called `agent`).
+    """
 
     def __init__(self, name: str, cols: int, rows: int) -> None:
-        self.name = name
+        self.name = validate_session_name(name)
         self.cols = cols
         self.rows = rows
+        self._last_failure_msg = ""
+
+    # --- targets ---------------------------------------------------------
+
+    def _session_target(self, name: str | None = None) -> str:
+        return f"={name or self.name}"
+
+    def _pane_target(self, name: str | None = None) -> str:
+        return f"={name or self.name}:"
 
     def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["tmux", *args], capture_output=True, text=True, check=check
         )
 
-    def ensure(self) -> None:
+    # --- lifecycle -------------------------------------------------------
+
+    def ensure(self, name: str | None = None) -> None:
+        """Create session `name` (default: current) if missing, then size it."""
+        name = name or self.name
         if not shutil.which("tmux"):
             raise RuntimeError("tmux is not installed or not in PATH")
-        exists = self._run("has-session", "-t", self.name, check=False).returncode == 0
+        exists = (
+            self._run("has-session", "-t", self._session_target(name), check=False)
+            .returncode == 0
+        )
         if not exists:
-            logger.info("creating tmux session %s (%dx%d)", self.name, self.cols, self.rows)
+            logger.info("creating tmux session %s (%dx%d)", name, self.cols, self.rows)
             self._run(
-                "new-session", "-d", "-s", self.name,
+                "new-session", "-d", "-s", name,
                 "-x", str(self.cols), "-y", str(self.rows),
             )
         else:
-            logger.info("attaching to existing tmux session %s", self.name)
-            self._run(
-                "resize-window", "-t", self.name,
-                "-x", str(self.cols), "-y", str(self.rows),
-                check=False,
-            )
+            logger.info("attaching to existing tmux session %s", name)
+        if LOCK_SIZE:
+            # `window-size` is a session option on older tmux and a window
+            # option on newer tmux; try both, ignore whichever fails.
+            self._run("set-option", "-t", self._session_target(name),
+                      "window-size", "manual", check=False)
+            self._run("set-option", "-w", "-t", self._pane_target(name),
+                      "window-size", "manual", check=False)
+        self._run(
+            "resize-window", "-t", self._pane_target(name),
+            "-x", str(self.cols), "-y", str(self.rows),
+            check=False,
+        )
+
+    # --- capture ---------------------------------------------------------
 
     def capture_ansi(self) -> str:
         """Capture the active pane with SGR escapes preserved.
@@ -141,7 +223,7 @@ class _TmuxSession:
         frame instead of crashing.
         """
         result = self._run(
-            "capture-pane", "-p", "-e", "-t", self.name, check=False,
+            "capture-pane", "-p", "-e", "-t", self._pane_target(), check=False,
         )
         if result.returncode != 0:
             self._log_capture_failure("capture_ansi", result)
@@ -150,7 +232,7 @@ class _TmuxSession:
 
     def capture_plain(self) -> list[str]:
         result = self._run(
-            "capture-pane", "-p", "-t", self.name, check=False,
+            "capture-pane", "-p", "-t", self._pane_target(), check=False,
         )
         if result.returncode != 0:
             self._log_capture_failure("capture_plain", result)
@@ -161,15 +243,9 @@ class _TmuxSession:
         return [line[: self.cols].ljust(self.cols) for line in lines[: self.rows]]
 
     def capture_scrollback(self, lines: int) -> str:
-        """Capture the pane plus `lines` rows of scrollback as plain text.
-
-        Uses `tmux capture-pane -S -<n>` which indexes into the scrollback
-        buffer (negative = rows above the visible top). Returns the
-        scrollback rows followed by the currently-visible pane, in
-        top-to-bottom order.
-        """
+        """Capture the pane plus `lines` rows of scrollback as plain text."""
         result = self._run(
-            "capture-pane", "-p", "-S", f"-{lines}", "-t", self.name,
+            "capture-pane", "-p", "-S", f"-{lines}", "-t", self._pane_target(),
             check=False,
         )
         if result.returncode != 0:
@@ -177,24 +253,28 @@ class _TmuxSession:
             return ""
         return result.stdout
 
-    # Throttle "session gone" logs — they fire per frame otherwise.
-    _last_failure_msg: str = ""
-
     def _log_capture_failure(
         self, op: str, result: subprocess.CompletedProcess
     ) -> None:
+        # Throttle "session gone" logs — they fire per frame otherwise.
         msg = f"{op} failed on '{self.name}': {(result.stderr or '').strip()}"
         if msg != self._last_failure_msg:
             logger.warning("%s", msg)
             self._last_failure_msg = msg
 
+    # --- input -----------------------------------------------------------
+
     def send_literal(self, text: str, enter: bool = False) -> None:
-        self._run("send-keys", "-t", self.name, "-l", text)
+        # `--` stops option parsing so text like "--help" or "-x" is typed
+        # instead of being read as a send-keys flag.
+        self._run("send-keys", "-t", self._pane_target(), "-l", "--", text)
         if enter:
-            self._run("send-keys", "-t", self.name, "Enter")
+            self._run("send-keys", "-t", self._pane_target(), "Enter")
 
     def send_keys(self, *keys: str) -> None:
-        self._run("send-keys", "-t", self.name, *keys)
+        self._run("send-keys", "-t", self._pane_target(), *keys)
+
+    # --- sessions / windows ---------------------------------------------
 
     def list_sessions(self) -> list[str]:
         r = self._run("list-sessions", "-F", "#{session_name}", check=False)
@@ -204,7 +284,7 @@ class _TmuxSession:
 
     def list_windows(self) -> list[tuple[int, str, bool]]:
         r = self._run(
-            "list-windows", "-t", self.name,
+            "list-windows", "-t", self._session_target(),
             "-F", "#{window_index}\t#{window_name}\t#{window_active}",
             check=False,
         )
@@ -216,15 +296,22 @@ class _TmuxSession:
         return windows
 
     def select_window(self, target: str) -> None:
-        self._run("select-window", "-t", f"{self.name}:{target}")
+        self._run("select-window", "-t", f"={self.name}:{target}")
 
-    def switch_session(self, name: str) -> None:
+    def switch_session(self, name: str) -> str:
+        """Attach to (or create) `name`. Only commits the switch on success."""
+        name = validate_session_name(name)
+        self.ensure(name)
         self.name = name
-        self.ensure()
+        return name
 
 
 class _TerminalRenderer:
-    """pyte virtual terminal + PIL glyph drawer. Produces RGBA images."""
+    """pyte virtual terminal + PIL glyph drawer. Produces RGBA images.
+
+    Caches the last rendered image keyed on the captured ANSI text, so an
+    idle terminal costs one `tmux capture-pane` per frame and no drawing.
+    """
 
     def __init__(self, cols: int, rows: int, font_size: int) -> None:
         self.cols = cols
@@ -240,6 +327,9 @@ class _TerminalRenderer:
         self.height = _align(rows * char_h, 16)
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
+        self._lock = threading.Lock()
+        self._last_ansi: str | None = None
+        self._last_img: Image.Image | None = None
 
     def _feed_snapshot(self, ansi_text: str) -> None:
         self.screen.reset()
@@ -253,12 +343,17 @@ class _TerminalRenderer:
             self.stream.feed("\x1b[0m")
 
     def render(self, ansi_text: str) -> Image.Image:
-        self._feed_snapshot(ansi_text)
-        img = Image.new("RGBA", (self.width, self.height), DEFAULT_BG)
-        draw = ImageDraw.Draw(img)
-        for y in range(self.rows):
-            self._draw_row(draw, y, self.screen.buffer[y])
-        return img
+        with self._lock:
+            if ansi_text == self._last_ansi and self._last_img is not None:
+                return self._last_img
+            self._feed_snapshot(ansi_text)
+            img = Image.new("RGBA", (self.width, self.height), DEFAULT_BG)
+            draw = ImageDraw.Draw(img)
+            for y in range(self.rows):
+                self._draw_row(draw, y, self.screen.buffer[y])
+            self._last_ansi = ansi_text
+            self._last_img = img
+            return img
 
     def _draw_row(self, draw: ImageDraw.ImageDraw, y: int, row) -> None:
         x = 0
@@ -300,7 +395,7 @@ class TmuxHelper:
     # --- lifecycle --------------------------------------------------------
 
     def ensure(self) -> None:
-        """Create the tmux session if missing; resize otherwise."""
+        """Create the tmux session if missing; size it otherwise."""
         self._session.ensure()
 
     # --- identity / geometry ---------------------------------------------
@@ -332,7 +427,11 @@ class TmuxHelper:
     # --- capture ----------------------------------------------------------
 
     def render_frame(self) -> Image.Image:
-        """Capture the active pane as ANSI and render it to an RGBA image."""
+        """Capture the active pane as ANSI and render it to an RGBA image.
+
+        Returns the *same* Image object when the pane hasn't changed, so
+        callers can cheaply skip work with an identity check.
+        """
         return self._renderer.render(self._session.capture_ansi())
 
     def capture_lines(self) -> list[str]:
@@ -344,12 +443,7 @@ class TmuxHelper:
         return "\n".join(self._session.capture_plain())
 
     def capture_scrollback(self, lines: int) -> str:
-        """Plain-text pane plus `lines` rows of scrollback history.
-
-        Unlike `capture_text()` (visible pane only), this reaches back into
-        the tmux scrollback buffer so the agent can answer questions about
-        output that has already scrolled off-screen.
-        """
+        """Plain-text pane plus `lines` rows of scrollback history."""
         return self._session.capture_scrollback(lines)
 
     # --- input ------------------------------------------------------------
@@ -370,8 +464,9 @@ class TmuxHelper:
     def list_windows(self) -> list[tuple[int, str, bool]]:
         return self._session.list_windows()
 
-    def switch_session(self, name: str) -> None:
-        self._session.switch_session(name)
+    def switch_session(self, name: str) -> str:
+        """Switch to `name` (creating it if needed). Returns the clean name."""
+        return self._session.switch_session(name)
 
     def select_window(self, target: str) -> None:
         self._session.select_window(target)
@@ -379,49 +474,57 @@ class TmuxHelper:
     # --- Claude Code state detection -------------------------------------
 
     @staticmethod
+    def _tail_lines(screen: str, n: int) -> list[str]:
+        return [ln for ln in screen.splitlines() if ln.strip()][-n:]
+
+    @staticmethod
     def is_claude_busy(screen: str) -> bool:
-        """True if the pane text looks like Claude Code is processing
-        (shows "esc to interrupt" / Thinking / Running cues).
+        """True if Claude Code's status area shows it is working.
+
+        Only the bottom of the pane is inspected (where Claude Code draws its
+        spinner / "esc to interrupt" hint) so stale text higher up — or a
+        shell command that prints "Running..." — doesn't count.
         """
-        low = screen.lower()
+        tail = "\n".join(TmuxHelper._tail_lines(screen, 8)).lower()
         return (
-            "esc to interrupt" in low
-            or "thinking…" in low
-            or "thinking..." in low
-            or "running…" in low
-            or "running..." in low
+            "esc to interrupt" in tail
+            or "thinking…" in tail
+            or "thinking..." in tail
         )
 
     @staticmethod
-    def detect_claude_prompt(lines: list[str]) -> str | None:
-        """Return the question + options when the pane shows a Claude Code
-        confirmation prompt, else None.
+    def detect_claude_prompt(lines: list[str]) -> ClaudePrompt | None:
+        """Return the most recent question + numbered options on screen.
 
-        Shape:
+        Shape (inside Claude Code's prompt box):
             Do you want to proceed?
             ❯ 1. Yes
               2. Yes, and don't ask again …
               3. No, tell Claude what to do differently
+
+        Works for any number of options ≥ 2, as long as they are numbered
+        consecutively from 1 and start within a few lines of a line ending
+        in '?'.
         """
-        for i, raw in enumerate(lines):
-            line = raw.strip()
-            if not line:
+        cleaned = [ln.strip().strip(_BOX_CHARS).strip() for ln in lines]
+        found: ClaudePrompt | None = None
+        for i, line in enumerate(cleaned):
+            if not line.endswith("?"):
                 continue
-            low = line.lower()
-            if not (low.startswith("do you want") or low.startswith("would you like")):
-                continue
-            has_yes = False
-            has_no = False
-            context = [line]
-            for follow in lines[i + 1 : i + 10]:
-                s = follow.strip().lstrip("❯›>•").strip()
-                if not s:
+            options: list[tuple[int, str]] = []
+            gap = 0
+            for follow in cleaned[i + 1 : i + 16]:
+                if not follow:
                     continue
-                context.append(s)
-                if s.startswith("1.") and "yes" in s.lower():
-                    has_yes = True
-                if s.startswith("3.") and "no" in s.lower():
-                    has_no = True
-            if has_yes and has_no:
-                return "\n".join(context[:4])
-        return None
+                m = _OPTION_RE.match(follow)
+                if m and int(m.group(1)) == len(options) + 1:
+                    options.append((int(m.group(1)), m.group(2).strip()))
+                    continue
+                if options:
+                    break
+                gap += 1
+                if gap > 3:
+                    break
+            if len(options) >= 2:
+                found = ClaudePrompt(question=line, options=options)
+        return found

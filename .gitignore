@@ -8,3 +8,8 @@ xcuserdata/
 *.xcuserstate
 
 
+
+# Local SPM path dependency (clone of livekit/client-sdk-swift, see ios/README.md)
+ios/client-sdk-swift/
+# Vendored SPM dependencies (see ios/README.md "LiveKit SDK dependency")
+ios/vendor/

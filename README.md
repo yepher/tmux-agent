@@ -5,7 +5,7 @@ track and lets you drive the terminal by voice. When you connect to the room
 you see the tmux pane live; when you talk, the agent runs commands, sends
 keys, switches sessions or windows, and narrates what it's doing.
 
-Built on `livekit-agents` + OpenAI Realtime. Works from any LiveKit client —
+Built on `livekit-agents` with a realtime model served by LiveKit Inference. Works from any LiveKit client —
 a browser (e.g. <https://meet.livekit.io>), or the custom iOS app bundled
 here, which also tunnels HTTP requests to a dev server running on the agent
 machine so you can view it from your phone.
@@ -27,11 +27,11 @@ Anthropic ships [Claude Code Remote Control](https://code.claude.com/docs/remote
 
 **Use this project when** you need one (or more) of:
 
-- **Voice as the primary interface.** You talk to an OpenAI Realtime agent; it drives the terminal. No typing on your phone. Remote Control is still a text chat.
+- **Voice as the primary interface.** You talk to a realtime voice agent (via LiveKit Inference); it drives the terminal. No typing on your phone. Remote Control is still a text chat.
 - **Driving things other than Claude Code.** The agent here sits in front of *any* tmux program — a shell, `vim`, `htop`, a dev server, a long-running build — and Claude Code is just one of the things it might be driving. Remote Control only exposes Claude Code.
 - **Actually seeing the terminal.** The iOS app receives the live tmux pane as a video track — colors, cursor, spinners, the whole TUI. Remote Control shows the chat transcript, not the terminal.
 - **Browsing dev servers from your phone.** The iOS client has an in-app `WKWebView` that tunnels HTTP through LiveKit to the agent machine, so `tunnel://localhost/` on the phone reaches your `localhost:3000` dev server. Remote Control doesn't do this.
-- **Self-hosted infra on your own API keys.** Bring your own LiveKit and OpenAI credentials; nothing is gated by a Claude subscription tier.
+- **Self-hosted infra on your own API keys.** Bring your own LiveKit project; the voice model runs on LiveKit Inference with the same credentials, and nothing is gated by a Claude subscription tier.
 
 
 ## Layout

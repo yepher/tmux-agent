@@ -20,6 +20,8 @@ import html as _html
 import json
 import logging
 import os
+from collections.abc import Callable
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 from livekit import rtc
@@ -34,6 +36,23 @@ PROXY_TIMEOUT = float(os.getenv("TMUX_PROXY_TIMEOUT", "30"))
 _HOP_BY_HOP = frozenset(
     {"host", "connection", "content-length", "transfer-encoding"}
 )
+# aiohttp transparently decompresses response bodies, so the upstream
+# Content-Encoding no longer describes what we send back. Forwarding it
+# makes WKWebView try to gunzip plain bytes and render garbage.
+_DROP_RESPONSE = _HOP_BY_HOP | {"content-encoding"}
+
+TUNNEL_ORIGIN = "tunnel://localhost"
+
+
+def _merge_headers(items, drop: frozenset[str]) -> dict[str, str]:
+    """Flatten a multi-valued header list into a dict, joining repeats with
+    ', ' (Foundation does the same, and parses comma-joined Set-Cookie)."""
+    out: dict[str, str] = {}
+    for k, v in items:
+        if k.lower() in drop:
+            continue
+        out[k] = f"{out[k]}, {v}" if k in out else v
+    return out
 
 
 def _error_html(status: int, title: str, message: str, target: str) -> bytes:
@@ -69,6 +88,29 @@ def _error_html(status: int, title: str, message: str, target: str) -> bytes:
     return body.encode("utf-8")
 
 
+def _rewrite_location(value: str, target: str) -> str:
+    """Map an absolute redirect to the dev server back into the tunnel.
+
+    With `allow_redirects=False` the webview follows 3xx itself; a Location
+    of `http://localhost:3000/login` would escape the tunnel and hit the
+    phone's own localhost. Relative locations are left alone.
+    """
+    try:
+        loc = urlsplit(value)
+        tgt = urlsplit(target)
+    except ValueError:
+        return value
+    if not loc.netloc:
+        return value
+    local_hosts = {"localhost", "127.0.0.1", "::1", (tgt.hostname or "").lower()}
+    default_port = {"http": 80, "https": 443}
+    loc_port = loc.port or default_port.get(loc.scheme or tgt.scheme)
+    tgt_port = tgt.port or default_port.get(tgt.scheme)
+    if (loc.hostname or "").lower() in local_hosts and loc_port == tgt_port:
+        return urlunsplit(("tunnel", "localhost", loc.path or "/", loc.query, loc.fragment))
+    return value
+
+
 class RtcProxy:
     """Attach to a LiveKit `Room`, proxy iOS webview requests to a local
     HTTP target, stream responses back.
@@ -89,11 +131,13 @@ class RtcProxy:
         request_topic: str = PROXY_REQUEST_TOPIC,
         response_topic: str = PROXY_RESPONSE_TOPIC,
         timeout: float = PROXY_TIMEOUT,
+        is_allowed: Callable[[str], bool] = lambda _identity: True,
     ) -> None:
         self.target = target.rstrip("/")
         self.request_topic = request_topic
         self.response_topic = response_topic
         self.timeout = timeout
+        self._is_allowed = is_allowed
         self._http: aiohttp.ClientSession | None = None
         self._room: rtc.Room | None = None
         self._tasks: set[asyncio.Task[None]] = set()
@@ -148,7 +192,8 @@ class RtcProxy:
           Response stream attrs: id, status, status_text, headers (JSON)
           Response stream body:  response body bytes
         """
-        assert self._room is not None and self._http is not None
+        if self._room is None or self._http is None:
+            return
 
         attrs = dict(reader.info.attributes or {})
         req_id = attrs.get("id", reader.info.stream_id)
@@ -158,6 +203,20 @@ class RtcProxy:
             headers = json.loads(attrs.get("headers", "{}") or "{}")
         except json.JSONDecodeError:
             headers = {}
+
+        if not self._is_allowed(remote_identity):
+            logger.warning(
+                "proxy: rejecting request from unauthorized identity %r",
+                remote_identity,
+            )
+            await self._respond(
+                remote_identity, req_id, 403, "Forbidden",
+                {"Content-Type": "text/html; charset=utf-8"},
+                _error_html(403, "Forbidden",
+                            f"Identity '{remote_identity}' is not allowed to "
+                            "use this tunnel.", self.target),
+            )
+            return
 
         body_chunks: list[bytes] = []
         async for chunk in reader:
@@ -187,10 +246,10 @@ class RtcProxy:
             ) as resp:
                 status = resp.status
                 status_text = resp.reason or ""
-                res_headers = {
-                    k: v for k, v in resp.headers.items()
-                    if k.lower() not in _HOP_BY_HOP
-                }
+                res_headers = _merge_headers(resp.headers.items(), _DROP_RESPONSE)
+                for k in list(res_headers):
+                    if k.lower() == "location":
+                        res_headers[k] = _rewrite_location(res_headers[k], self.target)
                 res_body = await resp.read()
         except asyncio.TimeoutError:
             status, status_text = 504, "Gateway Timeout"
@@ -227,6 +286,24 @@ class RtcProxy:
             method, url, status, req_id, len(res_body),
         )
 
+        await self._respond(
+            remote_identity, req_id, status, status_text, res_headers, res_body
+        )
+
+    async def _respond(
+        self,
+        remote_identity: str,
+        req_id: str,
+        status: int,
+        status_text: str,
+        res_headers: dict[str, str],
+        res_body: bytes,
+    ) -> None:
+        assert self._room is not None
+        content_type = next(
+            (v for k, v in res_headers.items() if k.lower() == "content-type"),
+            "application/octet-stream",
+        )
         writer = await self._room.local_participant.stream_bytes(
             name=f"response-{req_id}",
             topic=self.response_topic,
@@ -238,9 +315,7 @@ class RtcProxy:
                 "headers": json.dumps(res_headers),
             },
             total_size=len(res_body),
-            mime_type=res_headers.get(
-                "Content-Type", "application/octet-stream"
-            ).split(";")[0].strip(),
+            mime_type=content_type.split(";")[0].strip(),
         )
         try:
             if res_body:

@@ -2,8 +2,10 @@ import CryptoKit
 import Foundation
 
 /// Mints a LiveKit access token on-device (HS256 JWT signed with the API secret).
-/// For a dev tool this is fine; for production, move JWT minting to a server
-/// so the API secret never leaves your backend.
+///
+/// Fallback only: the API secret grants admin over the whole LiveKit
+/// project, so prefer the token server (`agent/token_server.py`, configured
+/// in Settings) which keeps the secret on your machine.
 enum TokenBuilder {
     struct TokenError: LocalizedError {
         let message: String
@@ -15,6 +17,7 @@ enum TokenBuilder {
         apiSecret: String,
         identity: String,
         room: String,
+        agentName: String? = nil,
         ttlSeconds: TimeInterval = 3600
     ) throws -> String {
         guard !apiKey.isEmpty, !apiSecret.isEmpty, !identity.isEmpty, !room.isEmpty else {
@@ -32,7 +35,7 @@ enum TokenBuilder {
             "canPublishData": true,
             "canSubscribe": true,
         ]
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "iss": apiKey,
             "sub": identity,
             "name": identity,
@@ -40,6 +43,11 @@ enum TokenBuilder {
             "exp": exp,
             "video": video,
         ]
+        // Explicit agent dispatch: the room asks for the named agent when it
+        // is created, so the worker doesn't need automatic dispatch.
+        if let agentName, !agentName.isEmpty {
+            payload["roomConfig"] = ["agents": [["agentName": agentName]]]
+        }
 
         let headerJSON = try JSONSerialization.data(
             withJSONObject: header, options: [.sortedKeys])

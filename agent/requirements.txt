@@ -1,4 +1,6 @@
-livekit-agents[openai]~=1.4
+# >=1.8.4 for LiveKit Inference realtime models (inference.RealtimeModel)
+livekit-agents~=1.8,>=1.8.4
+livekit-api
 python-dotenv
 Pillow
 pyte

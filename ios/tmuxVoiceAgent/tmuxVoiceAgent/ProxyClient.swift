@@ -11,9 +11,10 @@ import LiveKit
 ///   Response stream attributes: id, status, status_text, headers (JSON dict)
 ///   Response body: the HTTP response body bytes
 ///
-/// Modeled as an actor so the pending-continuation map and the register flag
-/// are safely mutated from both the public `send` entry and the byte-stream
-/// handler callback.
+/// Every pending request ends exactly once: with the agent's response, a
+/// write error, a timeout, task cancellation, or `failAll` (disconnect /
+/// agent left). Modeled as an actor so the pending maps are only touched
+/// from one place.
 actor ProxyClient {
     struct Response: Sendable {
         let status: Int
@@ -24,10 +25,12 @@ actor ProxyClient {
 
     static let requestTopic = "http.request"
     static let responseTopic = "http.response"
+    static let defaultTimeout: TimeInterval = 30
 
     nonisolated let room: Room
 
     private var pending: [String: CheckedContinuation<Response, Error>] = [:]
+    private var timeouts: [String: Task<Void, Never>] = [:]
     private var isHandlerRegistered = false
 
     init(room: Room) {
@@ -50,12 +53,14 @@ actor ProxyClient {
     }
 
     /// Send one HTTP request through the tunnel; suspend until the agent's
-    /// response arrives (or the outbound write errors).
+    /// response arrives, the write fails, `timeout` elapses, or the calling
+    /// task is cancelled.
     func send(
         method: String,
         path: String,
         headers: [String: String],
-        body: Data?
+        body: Data?,
+        timeout: TimeInterval = ProxyClient.defaultTimeout
     ) async throws -> Response {
         let id = UUID().uuidString
         guard let agentIdentity = resolveAgentIdentity() else {
@@ -84,8 +89,36 @@ actor ProxyClient {
             totalSize: body?.count
         )
 
-        return try await withCheckedThrowingContinuation { cont in
+        return try await withTaskCancellationHandler {
+            try await self.awaitResponse(
+                id: id, options: options, body: body, timeout: timeout
+            )
+        } onCancel: {
+            Task { await self.complete(id: id, with: .failure(CancellationError())) }
+        }
+    }
+
+    /// Register the continuation for `id`, arm its timeout, and write the
+    /// request stream. Runs on the actor so `pending` is mutated safely.
+    private func awaitResponse(
+        id: String,
+        options: StreamByteOptions,
+        body: Data?,
+        timeout: TimeInterval
+    ) async throws -> Response {
+        try await withCheckedThrowingContinuation { cont in
+            // Cancelled before we registered: onCancel already ran and
+            // found nothing to fail, so finish here.
+            if Task.isCancelled {
+                cont.resume(throwing: CancellationError())
+                return
+            }
             pending[id] = cont
+            timeouts[id] = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                await self?.complete(id: id, with: .failure(URLError(.timedOut)))
+            }
             Task { [weak self] in
                 do {
                     guard let self else { return }
@@ -96,16 +129,28 @@ actor ProxyClient {
                     }
                     try await writer.close()
                 } catch {
-                    await self?.failPending(id: id, error: error)
+                    await self?.complete(id: id, with: .failure(error))
                 }
             }
         }
     }
 
-    private func failPending(id: String, error: Error) {
-        if let cont = pending.removeValue(forKey: id) {
+    /// Fail every in-flight request (room disconnected / agent left).
+    func failAll(_ error: Error = URLError(.networkConnectionLost)) {
+        let conts = pending
+        pending.removeAll()
+        timeouts.values.forEach { $0.cancel() }
+        timeouts.removeAll()
+        for cont in conts.values {
             cont.resume(throwing: error)
         }
+    }
+
+    /// Resolve request `id` exactly once; later calls are no-ops.
+    private func complete(id: String, with result: Result<Response, Error>) {
+        timeouts.removeValue(forKey: id)?.cancel()
+        guard let cont = pending.removeValue(forKey: id) else { return }
+        cont.resume(with: result)
     }
 
     private func handleResponse(reader: ByteStreamReader) async {
@@ -127,21 +172,16 @@ actor ProxyClient {
                 body.append(chunk)
             }
         } catch {
-            if let cont = pending.removeValue(forKey: id) {
-                cont.resume(throwing: error)
-            }
+            complete(id: id, with: .failure(error))
             return
         }
 
-        let response = Response(
+        complete(id: id, with: .success(Response(
             status: status,
             statusText: statusText,
             headers: headers,
             body: body
-        )
-        if let cont = pending.removeValue(forKey: id) {
-            cont.resume(returning: response)
-        }
+        )))
     }
 
     private func resolveAgentIdentity() -> String? {
@@ -153,6 +193,5 @@ actor ProxyClient {
         }
         return room.remoteParticipants.values
             .first?.identity?.stringValue
-        
     }
 }

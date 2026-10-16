@@ -201,15 +201,23 @@ class VideoPublisher:
         next_t = perf_counter()
         frames = 0
         last_frame_error: str = ""
+        last_img: Image.Image | None = None
         try:
             while True:
                 try:
-                    img = self.frame_source()
-                    if img.size != (self.width, self.height):
-                        img = _pad(img, self.width, self.height)
-                    if img.mode != "RGBA":
-                        img = img.convert("RGBA")
-                    np.copyto(self._view, np.asarray(img, dtype=np.uint8))
+                    # Capture + render shells out to tmux and draws with PIL;
+                    # run it off the event loop so realtime audio isn't starved.
+                    img = await asyncio.to_thread(self.frame_source)
+                    # Frame sources return the same object when nothing
+                    # changed — skip the pad/convert/copy in that case.
+                    if img is not last_img:
+                        src = img
+                        if img.size != (self.width, self.height):
+                            img = _pad(img, self.width, self.height)
+                        if img.mode != "RGBA":
+                            img = img.convert("RGBA")
+                        np.copyto(self._view, np.asarray(img, dtype=np.uint8))
+                        last_img = src
                 except Exception as e:  # pylint: disable=broad-exception-caught
                     # Don't kill the stream on transient frame-source errors
                     # (e.g. user typed `exit` and the tmux session died).
@@ -231,7 +239,13 @@ class VideoPublisher:
                 if frames <= 5 or frames % 100 == 0:
                     logger.info("pushed frame %d", frames)
                 next_t += dt
-                await asyncio.sleep(next_t - perf_counter())
+                delay = next_t - perf_counter()
+                if delay < 0:
+                    # Fell behind (slow render / loop stall): resync instead
+                    # of firing a burst of catch-up frames.
+                    next_t = perf_counter()
+                    delay = 0
+                await asyncio.sleep(delay)
         except asyncio.CancelledError:
             logger.info("stream cancelled at frame %d", frames)
             raise

@@ -12,11 +12,16 @@ import WebKit
 /// The webview loads `tunnel://localhost/...` and relative URLs stay inside
 /// the scheme; the agent maps them onto `PROXY_TARGET` (default
 /// `http://localhost:3000`).
+///
+/// WebKit raises an exception if we call `didReceive`/`didFinish`/
+/// `didFailWithError` on a task after `stop` was called for it, so every
+/// completion path checks `isLive` first.
 final class TunnelSchemeHandler: NSObject, WKURLSchemeHandler {
     static let scheme = "tunnel"
 
     private let proxy: ProxyClient
     private var activeTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+    private var stoppedTasks: Set<ObjectIdentifier> = []
 
     init(proxy: ProxyClient) {
         self.proxy = proxy
@@ -34,27 +39,46 @@ final class TunnelSchemeHandler: NSObject, WKURLSchemeHandler {
         }
         let headers = (request.allHTTPHeaderFields ?? [:])
         let body = request.httpBody ?? readHTTPBodyStream(request)
+        let timeout = request.timeoutInterval > 0
+            ? request.timeoutInterval : ProxyClient.defaultTimeout
 
         let taskId = ObjectIdentifier(urlSchemeTask)
-        let task = Task { @MainActor in
+        let proxy = self.proxy
+        let task = Task { @MainActor [weak self] in
             do {
                 let response = try await proxy.send(
-                    method: method, path: path, headers: headers, body: body
+                    method: method, path: path, headers: headers, body: body,
+                    timeout: timeout
                 )
-                fulfill(task: urlSchemeTask, url: url, response: response)
+                if let self, self.isLive(taskId) {
+                    self.fulfill(task: urlSchemeTask, url: url, response: response)
+                }
             } catch is CancellationError {
                 // stopURLSchemeTask already called; nothing to fulfill.
             } catch {
-                urlSchemeTask.didFailWithError(error)
+                if let self, self.isLive(taskId) {
+                    urlSchemeTask.didFailWithError(error)
+                }
             }
-            activeTasks.removeValue(forKey: taskId)
+            self?.finish(taskId)
         }
         activeTasks[taskId] = task
     }
 
     func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
         let taskId = ObjectIdentifier(urlSchemeTask)
-        activeTasks.removeValue(forKey: taskId)?.cancel()
+        guard let task = activeTasks.removeValue(forKey: taskId) else { return }
+        stoppedTasks.insert(taskId)
+        task.cancel()
+    }
+
+    private func isLive(_ taskId: ObjectIdentifier) -> Bool {
+        !Task.isCancelled && !stoppedTasks.contains(taskId)
+    }
+
+    private func finish(_ taskId: ObjectIdentifier) {
+        activeTasks.removeValue(forKey: taskId)
+        stoppedTasks.remove(taskId)
     }
 
     private func fulfill(
@@ -64,6 +88,13 @@ final class TunnelSchemeHandler: NSObject, WKURLSchemeHandler {
     ) {
         let target = url ?? URL(string: "tunnel://localhost/")!
         var httpHeaders = response.headers
+        // The body is already decoded; drop any length/encoding the agent
+        // didn't strip and set the real length.
+        for key in httpHeaders.keys where
+            ["content-length", "content-encoding", "transfer-encoding"]
+                .contains(key.lowercased()) {
+            httpHeaders.removeValue(forKey: key)
+        }
         httpHeaders["Content-Length"] = "\(response.body.count)"
         // HTTPURLResponse's initializer returns optional but only returns nil
         // for invalid URLs — `target` is always a valid `tunnel://` URL.

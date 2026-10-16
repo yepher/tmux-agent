@@ -22,7 +22,9 @@ Key sources:
 - `ContentView.swift` — tab root: Agent / Browser / Settings.
 - `SettingsStore.swift` + `SettingsView.swift` — Keychain-backed creds form.
 - `Keychain.swift` — Security-framework wrapper.
-- `TokenBuilder.swift` — HS256 JWT minting via CryptoKit.
+- `TokenServerClient.swift` — fetches tokens from `agent/token_server.py`
+  (preferred: the API secret stays off the phone).
+- `TokenBuilder.swift` — fallback HS256 JWT minting via CryptoKit.
 - `RoomConnection.swift` — `@Observable` LiveKit room + delegate adapter.
 - `RoomView.swift` — renders the agent's video track, mic toggle, hangup.
 - `LiveKitVideoView.swift` — `UIViewRepresentable` wrapping `LiveKit.VideoView`.
@@ -31,7 +33,6 @@ Key sources:
   over LiveKit byte streams (`http.request` / `http.response`).
 - `TunnelSchemeHandler.swift` — `WKURLSchemeHandler` for the `tunnel://`
   scheme.
-- `SocksProxy.swift` — vestigial; see "Browser tab" below.
 - `OrientationLock.swift` — per-view `UIInterfaceOrientationMask` helper.
 
 ## Xcode setup
@@ -45,19 +46,40 @@ Key sources:
 ### LiveKit SDK dependency
 
 The project links `LiveKit` via a **local path** dependency at
-`ios/client-sdk-swift/`. If you pulled this repo fresh, clone the SDK alongside
-the app:
+`ios/client-sdk-swift/`. That clone's own dependencies are also local, in
+`ios/vendor/`, so Xcode never fetches anything from GitHub. Xcode's built-in
+git and artifact downloads kept failing with GitHub auth errors in the
+author's environment, even for public repos. Both folders are gitignored. To
+recreate them:
 
 ```bash
 cd ios
-git clone https://github.com/livekit/client-sdk-swift
-# git checkout a tagged release if you prefer reproducibility
+git clone --branch 2.13.0 --depth 1 https://github.com/livekit/client-sdk-swift
+mkdir -p vendor && cd vendor
+git clone --branch 144.7559.03 --depth 1 https://github.com/livekit/webrtc-xcframework
+git clone --branch 0.0.5 --depth 1 https://github.com/livekit/livekit-uniffi-xcframework
+git clone --branch 1.36.1 --depth 1 --recurse-submodules --shallow-submodules https://github.com/apple/swift-protobuf
+curl -L -o webrtc-xcframework/LiveKitWebRTC.xcframework.zip \
+  https://github.com/livekit/webrtc-xcframework/releases/download/144.7559.03/LiveKitWebRTC.xcframework.zip
+curl -L -o livekit-uniffi-xcframework/RustLiveKitUniFFI.xcframework.zip \
+  https://github.com/livekit/livekit-uniffi-xcframework/releases/download/0.0.5/RustLiveKitUniFFI.xcframework.zip
+shasum -a 256 */*.zip
+# 892898ba…d4fd  LiveKitWebRTC.xcframework.zip
+# 9a21e046…2600  RustLiveKitUniFFI.xcframework.zip
 ```
 
-If you'd rather use the remote SPM version: **File → Add Package Dependencies…
-→ `https://github.com/livekit/client-sdk-swift`** and remove the local
-reference. The local path was adopted because Xcode's GitHub auth kept failing
-in the author's environment.
+Then patch the manifests:
+
+- In `vendor/webrtc-xcframework/Package.swift` and
+  `vendor/livekit-uniffi-xcframework/Package*.swift`, replace each binary
+  target's `url:` + `checksum:` with `path: "<the .zip name>"`.
+- In `client-sdk-swift/Package*.swift`, point the three dependencies at
+  `.package(path: "../vendor/<name>")` and delete the `swift-docc-plugin`
+  line (it's only used for docs).
+
+If GitHub works from Xcode for you, you can skip all of this: **File → Add
+Package Dependencies… → `https://github.com/livekit/client-sdk-swift`**
+(2.13.0) and remove the local reference.
 
 ### Info.plist keys
 
@@ -68,17 +90,32 @@ in the author's environment.
 
 ## Settings
 
-LiveKit creds live in the Keychain (`Keychain.swift`), not UserDefaults — the
-API secret is sensitive. Fields the settings form captures:
+Settings live in the Keychain (`Keychain.swift`), not UserDefaults.
+
+**Token server (recommended).** Run `agent/token_server.py` on your machine
+and enter its URL and `TOKEN_SERVER_KEY`. The app POSTs your identity and
+room name to it and gets back a LiveKit URL and token. The LiveKit API secret
+never touches the phone. The token server only mints tokens for
+`TMUX_ALLOWED_IDENTITIES` and adds explicit agent dispatch for you. Expose it
+over HTTPS (Tailscale, cloudflared, ngrok). App Transport Security blocks
+plain `http://` unless you add an ATS exception.
+
+**On-device minting (fallback).** If the token server URL is empty, the app
+mints tokens itself with:
 
 - `livekit_url` (e.g. `wss://chris-test-xxx.livekit.cloud`)
 - `livekit_api_key`
-- `livekit_api_secret`
-- `room_name` (free text, e.g. `my-room`)
-- `identity` (free text, e.g. `mobile-user`)
+- `livekit_api_secret`. This secret grants admin over the whole project,
+  so only use this mode with a project dedicated to this tool.
 
-Tokens are minted on-device via `TokenBuilder`. For a dev tool this is fine —
-move to a token server if you distribute the app.
+Both modes use:
+
+- `room_name` (free text, e.g. `my-room`)
+- `identity` (free text, e.g. `mobile-user`). Must be in the agent's
+  `TMUX_ALLOWED_IDENTITIES` if that's set.
+- `agent_name` (default `tmux-agent`). Must match the agent's
+  `TMUX_AGENT_NAME`. The token carries `roomConfig.agents` so LiveKit
+  dispatches the agent when the room is created.
 
 On connect the room name is suffixed with the current epoch seconds
 (`my-room-1713461234`) so every reconnect lands in a fresh room and doesn't
@@ -144,10 +181,6 @@ Apple-side paperwork. `WKURLSchemeHandler` can intercept any scheme
 agent maps the path onto `PROXY_TARGET` (default `http://localhost:3000`)
 on its own machine.
 
-`SocksProxy.swift` is a vestige of the proxy-configurations attempt and
-is intentionally left as an empty file for Xcode project stability — you
-can remove the reference from the project at your convenience.
-
 **Why byte streams, not RPC.** LiveKit RPC caps payloads at ~15 KB — way
 below a typical JS bundle. Byte streams have no meaningful cap; we've
 moved 900 KB+ chunks through them without issue.
@@ -162,9 +195,13 @@ moved 900 KB+ chunks through them without issue.
 - **Browser tab shows a stale page after you edit the dev server** — hit the
   reload button (circular arrow) next to Go. It forces a re-fetch through the
   tunnel.
-- **Browser tab shows "not connected"** — SOCKS-based proxy config only
-  works on iOS 17+. The minimum deployment target for the project is iOS
-  17.0; if you lower it, the tunnel breaks.
-- **Connect spinner hangs** — check the Agent tab is dispatching. The
-  mobile app only joins the room; something has to tell LiveKit to start the
-  agent job (Cloud Agents playground, or your own dispatch frontend).
+- **Browser tab shows "not connected"** — connect on the Agent tab first.
+  Tunnel requests time out after 30s and fail right away if the agent leaves
+  the room.
+- **Connected but the agent never joins** — the agent uses explicit dispatch.
+  Check that Settings → Agent name matches `TMUX_AGENT_NAME` on the agent, and
+  that your identity is in `TMUX_ALLOWED_IDENTITIES` (the agent log says
+  "ignoring participant" when it isn't).
+- **Video shows nothing** — the app prefers the agent's screen-share track
+  and falls back to any video track, so check the agent's log for
+  "video track published".

@@ -46,17 +46,34 @@ final class RoomConnection {
         }
         state = .connecting
         do {
-            // Append the current epoch-seconds so every connect creates a
-            // fresh room. LiveKit auto-creates rooms on first join, so no
-            // server-side pre-provisioning needed.
-            let uniqueRoom = "\(settings.room)-\(Int(Date().timeIntervalSince1970))"
-            let token = try TokenBuilder.build(
-                apiKey: settings.apiKey,
-                apiSecret: settings.apiSecret,
-                identity: settings.identity,
-                room: uniqueRoom
-            )
-            try await room.connect(url: settings.url, token: token)
+            let serverURL: String
+            let token: String
+            if settings.usesTokenServer {
+                // Preferred: the token server mints the token (with agent
+                // dispatch) so the API secret stays off the phone.
+                let creds = try await TokenServerClient.fetch(
+                    serverURL: settings.tokenServerURL,
+                    key: settings.tokenServerKey,
+                    identity: settings.identity,
+                    room: settings.room
+                )
+                serverURL = creds.url.isEmpty ? settings.url : creds.url
+                token = creds.token
+            } else {
+                // Append the current epoch-seconds so every connect creates a
+                // fresh room. LiveKit auto-creates rooms on first join, so no
+                // server-side pre-provisioning needed.
+                let uniqueRoom = "\(settings.room)-\(Int(Date().timeIntervalSince1970))"
+                serverURL = settings.url
+                token = try TokenBuilder.build(
+                    apiKey: settings.apiKey,
+                    apiSecret: settings.apiSecret,
+                    identity: settings.identity,
+                    room: uniqueRoom,
+                    agentName: settings.agentName
+                )
+            }
+            try await room.connect(url: serverURL, token: token)
             state = .connected
             // Rescan any tracks that may already be subscribed.
             refreshScreenShareTrack()
@@ -68,6 +85,8 @@ final class RoomConnection {
     }
 
     func disconnect() async {
+        // Fail in-flight tunnel requests so webview loads don't hang.
+        await proxy?.failAll(URLError(.networkConnectionLost))
         await room.disconnect()
         state = .disconnected
         screenShareTrack = nil
@@ -118,16 +137,37 @@ final class RoomConnection {
         }
     }
 
+    /// Prefer the agent's screen-share track; fall back to any subscribed
+    /// video track (e.g. `TMUX_COMPAT_TRACK_SOURCE=camera` on the agent).
     fileprivate func refreshScreenShareTrack() {
+        var fallback: VideoTrack?
         for participant in room.remoteParticipants.values {
             for pub in participant.videoTracks {
-                if pub.source == .screenShareVideo, let t = pub.track as? VideoTrack {
+                guard let t = pub.track as? VideoTrack else { continue }
+                if pub.source == .screenShareVideo {
                     screenShareTrack = t
                     return
                 }
+                if fallback == nil { fallback = t }
             }
         }
-        screenShareTrack = nil
+        screenShareTrack = fallback
+    }
+
+    /// The agent left: anything waiting on the tunnel will never be answered.
+    fileprivate func participantLeft(identity: String) {
+        refreshScreenShareTrack()
+        if identity.lowercased().hasPrefix("agent") {
+            Task { await proxy?.failAll(URLError(.networkConnectionLost)) }
+        }
+    }
+
+    /// The agent publishes `tmux.session` whenever the active session
+    /// changes — including switches made by voice — so keep the menu in sync.
+    fileprivate func attributesChanged(_ attributes: [String: String]) {
+        guard let name = attributes["tmux.session"] else { return }
+        currentSession = name
+        Task { await refreshSessions() }
     }
 }
 
@@ -151,6 +191,13 @@ private final class RoomDelegateAdapter: NSObject, RoomDelegate, @unchecked Send
     }
 
     func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
-        Task { @MainActor in owner?.refreshScreenShareTrack() }
+        let identity = participant.identity?.stringValue ?? ""
+        Task { @MainActor in owner?.participantLeft(identity: identity) }
+    }
+
+    func room(_ room: Room,
+              participant: Participant,
+              didUpdateAttributes attributes: [String: String]) {
+        Task { @MainActor in owner?.attributesChanged(attributes) }
     }
 }

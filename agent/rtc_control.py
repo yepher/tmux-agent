@@ -54,8 +54,13 @@ class RtcControl:
             await control.aclose()
     """
 
-    def __init__(self, tmux: TmuxHelper) -> None:
+    def __init__(
+        self,
+        tmux: TmuxHelper,
+        is_allowed: Callable[[str], bool] = lambda _identity: True,
+    ) -> None:
         self._tmux = tmux
+        self._is_allowed = is_allowed
         self._room: rtc.Room | None = None
         self.on_session_change: OnSessionChange = None
 
@@ -88,9 +93,20 @@ class RtcControl:
 
     # pylint: disable=unused-argument
     # (LiveKit's RPC signature passes `data` to all handlers; we only use it in _handle_switch.)
+    def _authorized(self, data: rtc.RpcInvocationData) -> bool:
+        if self._is_allowed(data.caller_identity):
+            return True
+        logger.warning(
+            "rpc %s: rejecting unauthorized caller %r",
+            getattr(data, "method", "?"), data.caller_identity,
+        )
+        return False
+
     async def _handle_list(self, data: rtc.RpcInvocationData) -> str:
+        if not self._authorized(data):
+            return json.dumps({"sessions": [], "current": "", "error": "unauthorized"})
         current = self._tmux.session_name
-        sessions = self._tmux.list_sessions()
+        sessions = await asyncio.to_thread(self._tmux.list_sessions)
         # Ensure the current session is always in the list, even if tmux
         # hasn't flushed it yet.
         if current and current not in sessions:
@@ -103,6 +119,8 @@ class RtcControl:
         })
 
     async def _handle_switch(self, data: rtc.RpcInvocationData) -> str:
+        if not self._authorized(data):
+            return json.dumps({"ok": False, "error": "unauthorized"})
         try:
             req = json.loads(data.payload or "{}")
         except json.JSONDecodeError:
@@ -111,8 +129,10 @@ class RtcControl:
         if not name:
             return json.dumps({"ok": False, "error": "missing session name"})
         try:
-            self._tmux.switch_session(name)
+            name = await asyncio.to_thread(self._tmux.switch_session, name)
             logger.info("rpc sessions.switch: now on %s", name)
+        except ValueError as e:
+            return json.dumps({"ok": False, "error": str(e)})
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.exception("rpc sessions.switch failed")
             return json.dumps({"ok": False, "error": str(e)})
